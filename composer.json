@@ -1,0 +1,14 @@
+{
+  "require": {
+    "topthink/think-orm": "^4.0",
+    "jaeger/querylist": "^4.4",
+    "phpmailer/phpmailer": "^6.9",
+    "php-webdriver/webdriver": "^1.15",
+    "aliyuncs/oss-sdk-php": "^2.7",
+    "aws/aws-sdk-php": "^3.342",
+    "tecnickcom/tcpdf": "^6.9",
+    "fukuball/jieba-php": "^0.34.0",
+    "guzzlehttp/guzzle": "^7.9",
+    "phpoffice/phpspreadsheet": "^5.10"
+  }
+}
