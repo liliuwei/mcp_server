@@ -1,7 +1,7 @@
 <?php
 /**
  * ============================================================================
- * SHOPLINE Admin REST API MCP Server（HTTP 模式）
+ * SHOPLINE Admin REST API MCP Server（HTTP 模式）—— MCP 协议 2025-11-25
  * ============================================================================
  *
  * 【这个文件是干什么的】
@@ -13,6 +13,20 @@
  *   read_orders, read_assigned_fulfillment_orders, read_customers,
  *   read_products, read_inventory
  *
+ * 【MCP 协议版本：2025-11-25（legacy / 握手式）】
+ *   本文件按 MCP 2025-11-25 修订版实现，要点：
+ *     1. 保留 initialize 握手与 notifications/initialized 通知；保留 ping。
+ *     2. 版本协商：initialize 时若客户端请求的版本受支持，则回同版本；
+ *        否则回本服务支持的最新版本（2025-11-25）。
+ *     3. tools/call 同时返回 content（文本）与 structuredContent（结构化数据）；
+ *        注意 structuredContent 的**根必须是 JSON 对象**（2025-11-25 的约束）。
+ *     4. 输入校验错误（缺参数等）按 Tool Execution Error 返回，即 isError=true，
+ *        而不是协议级 error —— 这样模型能看到错误并自我纠正。
+ *     5. 握手之后，客户端应在所有请求上带 MCP-Protocol-Version 请求头。
+ *     6. JSON Schema 2020-12 为默认方言（inputSchema 已显式声明 $schema）。
+ *
+ *   另见：shopline_mcp_v2.php —— 同一批工具，但跑 2026-07-28 的无状态现代协议。
+ *
  * 【SHOPLINE 接口基础信息】
  *   请求地址：https://{handle}.myshopline.com/admin/openapi/{version}/xxx.json
  *   鉴权方式：Authorization: Bearer {access_token}
@@ -23,24 +37,21 @@
  *
  * 1. 改配置（见下方「配置」区）
  *    - $SHOPLINE_SHOP_HANDLE  ← 必填！店铺域名前缀。
- *      例如店铺后台是 https://open001.myshopline.com，则 handle 填 open001
  *    - $SHOPLINE_ACCESS_TOKEN ← 填你申请到的访问令牌
  *    - $MCP_TOKEN             ← 建议改成你自己的强随机字符串（保护这个接口）
  *
- * 2. 上传文件
- *    把本文件放到 Web 根目录，例如：
- *    /www/wwwroot/your-site/shopline_mcp.php
+ * 2. 上传文件到 Web 根目录，例如 /www/wwwroot/your-site/shopline_mcp.php
  *
- * 3. 配置 Nginx 传递 Authorization 头（用 Header 传 MCP Token 时才需要）
+ * 3. 配置 Nginx 传递请求头（用 Header 传 MCP Token / 传协议版本头时才需要）
  *    宝塔 + PHP 环境，在站点 server { } 块内、include enable-php-82.conf; 之前加：
  *
  *    location = /shopline_mcp.php {
- *        fastcgi_param HTTP_AUTHORIZATION $http_authorization;
+ *        fastcgi_param HTTP_AUTHORIZATION        $http_authorization;
+ *        fastcgi_param HTTP_MCP_PROTOCOL_VERSION $http_mcp_protocol_version;
  *        include enable-php-82.conf;
  *    }
  *
- * 4. 重载 Nginx
- *    nginx -t && nginx -s reload
+ * 4. 重载 Nginx：nginx -t && nginx -s reload
  *
  * 【鉴权方式（三种任选其一）】
  *   1. Header 传 Token（推荐，需要配 Nginx）
@@ -49,31 +60,6 @@
  *      ?token=your-mcp-token
  *   3. 不传 Token（直接放行，仅建议内网/测试）
  *   注意：只要传了 Token 就必须匹配，不匹配返回 401；完全不传才放行。
- *
- * 【接入 AI 客户端】
- *   支持远程 URL 的客户端（Claude Desktop 新版、Cursor、Cherry Studio…）：
- *   {
- *     "mcpServers": {
- *       "shopline": {
- *         "url": "https://your-domain.com/shopline_mcp.php",
- *         "headers": { "Authorization": "Bearer your-mcp-token" }
- *       }
- *     }
- *   }
- *
- *   只支持 stdio 的客户端，用 mcp-remote 桥接：
- *   {
- *     "mcpServers": {
- *       "shopline": {
- *         "command": "npx",
- *         "args": [
- *           "mcp-remote@latest",
- *           "https://your-domain.com/shopline_mcp.php",
- *           "--header", "Authorization: Bearer your-mcp-token"
- *         ]
- *       }
- *     }
- *   }
  *
  * 【自检】
  *   部署后先调 shopline_ping 工具，能返回订单数据就说明配置正确。
@@ -151,14 +137,37 @@ $SHOPLINE_SHOP_HANDLE = 'mileseeygolf';
 // SHOPLINE 访问令牌（App 授权后获得，形如 eyJhbGciOi...）
 $SHOPLINE_ACCESS_TOKEN = 'eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJhcHBJZCI6MCwiYXBwS2V5IjoiOWU4OGI5ZTEyNmMyNzRkYmUwNzdkZmExYzhjYTdmMTIzYmQ0MzQ5YiIsImV4cCI6MTg4NjIyMTQ5MCwiaXNzIjoieXNvdWwiLCJzZWxsZXJJZCI6IjI0MTIwNDAyMDUiLCJzdG9yZUlkIjoiMTczMzU2MjI2ODU1NyIsInRpbWVzdGFtcCI6MTc5MTUyNzA5MDYzNCwidmVyc2lvbiI6IlYyIn0.ydQRSK5unaKuUm_XP_bTtx8KCbu9iGlXz8SXG5taU8yFwU6Rna-JrYuw5O3xFm7m_lfRjo1A3H8X-QVo3acG0g';
 
-// API 版本（v20260901 为当前稳定版；可选 v20250301 / v20250601 / v20251201 / v20260301 / v20260601）
+// API 版本（v20260901 为当前稳定版）
 $SHOPLINE_API_VERSION = 'v20260901';
 
 // 单次请求超时（秒）
 $SHOPLINE_TIMEOUT = 30;
 
-// 返回给 AI 的正文最大字符数（超过会被截断，避免撑爆上下文）
+// content 文本正文最大字符数（structuredContent 不受此限制）
 $MAX_OUTPUT_CHARS = 50000;
+
+// ============================================================
+// MCP 2025-11-25 协议常量
+// ============================================================
+
+const MCP_PROTOCOL_VERSION   = '2025-11-25';
+const MCP_SUPPORTED_VERSIONS = ['2025-11-25'];
+
+const SERVER_NAME    = 'SHOPLINE_Admin_MCP';
+const SERVER_TITLE   = 'SHOPLINE 店铺数据（只读）';
+const SERVER_VERSION = '2.2.0';
+
+const JSON_SCHEMA_DIALECT = 'https://json-schema.org/draft/2020-12/schema';
+
+const SERVER_INSTRUCTIONS = 'SHOPLINE 店铺数据只读服务：订单、客户、商品、库存、履约单。'
+    . '订单查询（列表/详情）一律先查非隐藏订单，若为空再自动补查隐藏订单（hidden_order），避免漏单。'
+    . '分页用返回的 page_info 游标。建议先调用 shopline_ping 验证连通性。';
+
+// JSON-RPC 错误码
+const ERR_PARSE            = -32700;
+const ERR_INVALID_PARAMS   = -32602;
+const ERR_METHOD_NOT_FOUND = -32601;
+const ERR_INTERNAL         = -32603;
 
 // ============================================================
 // HTTP 入口
@@ -167,7 +176,8 @@ header('Content-Type: application/json; charset=utf-8');
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     http_response_code(405);
-    echo json_encode(['jsonrpc' => '2.0', 'error' => ['code' => -32600, 'message' => 'Method not allowed']]);
+    echo json_encode(['jsonrpc' => '2.0', 'id' => null,
+        'error' => ['code' => -32600, 'message' => 'Method not allowed']]);
     exit;
 }
 
@@ -177,29 +187,157 @@ $tokenFromHeader = '';
 if (preg_match('/^Bearer\s+(.+)$/i', $authHeader, $m)) {
     $tokenFromHeader = $m[1];
 }
-$tokenFromUrl   = $_GET['token'] ?? '';
-$providedToken  = $tokenFromHeader !== '' ? $tokenFromHeader : $tokenFromUrl;
+$tokenFromUrl  = $_GET['token'] ?? '';
+$providedToken = $tokenFromHeader !== '' ? $tokenFromHeader : $tokenFromUrl;
 
 if ($providedToken !== '' && !hash_equals($MCP_TOKEN, $providedToken)) {
     http_response_code(401);
-    echo json_encode(['jsonrpc' => '2.0', 'error' => ['code' => -32000, 'message' => 'Unauthorized: token mismatch']]);
+    echo json_encode(['jsonrpc' => '2.0', 'id' => null,
+        'error' => ['code' => -32000, 'message' => 'Unauthorized: token mismatch']]);
     exit;
 }
 
 $rawInput = file_get_contents('php://input');
 $request  = json_decode($rawInput, true);
 
-if ($request === null || !is_array($request)) {
+if (!is_array($request)) {
     http_response_code(400);
-    echo json_encode(['jsonrpc' => '2.0', 'error' => ['code' => -32700, 'message' => 'Parse error']]);
+    echo json_encode(['jsonrpc' => '2.0', 'id' => null,
+        'error' => ['code' => ERR_PARSE, 'message' => 'Parse error']]);
     exit;
 }
 
-$response = handleRequest($request);
+// 2025-11-25：握手之后客户端应在每个请求上带 MCP-Protocol-Version 头
+$hdrVersion = $_SERVER['HTTP_MCP_PROTOCOL_VERSION'] ?? '';
+
+$response = handleRequest($request, $hdrVersion);
 if ($response !== null) {
     echo json_encode($response, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 }
 exit;
+
+// ============================================================
+// MCP 协议层（2025-11-25，握手式）
+// ============================================================
+
+/**
+ * 处理一次 JSON-RPC 请求
+ *
+ * @param array  $request    JSON-RPC 请求体
+ * @param string $hdrVersion MCP-Protocol-Version 请求头
+ * @return array|null        通知类请求返回 null（不响应）
+ */
+function handleRequest(array $request, string $hdrVersion = ''): ?array
+{
+    $id     = $request['id'] ?? null;
+    $method = (string) ($request['method'] ?? '');
+    $params = is_array($request['params'] ?? null) ? $request['params'] : [];
+
+    // 通知（无 id）不需要响应
+    $isNotification = !array_key_exists('id', $request);
+
+    // 协议版本头校验（initialize 之后才有意义；缺失则宽松放行）
+    if ($method !== 'initialize' && $hdrVersion !== ''
+        && !in_array($hdrVersion, MCP_SUPPORTED_VERSIONS, true)) {
+        return [
+            'jsonrpc' => '2.0',
+            'id'      => $id,
+            'error'   => [
+                'code'    => ERR_INVALID_PARAMS,
+                'message' => 'Unsupported MCP-Protocol-Version header',
+                'data'    => ['supported' => MCP_SUPPORTED_VERSIONS, 'requested' => $hdrVersion],
+            ],
+        ];
+    }
+
+    $result = null;
+    $error  = null;
+
+    try {
+        switch ($method) {
+            case 'initialize':
+                // 版本协商：客户端版本受支持则回同版本，否则回本服务最新版本
+                $clientVersion = (string) ($params['protocolVersion'] ?? '');
+                $agreed = in_array($clientVersion, MCP_SUPPORTED_VERSIONS, true)
+                    ? $clientVersion
+                    : MCP_PROTOCOL_VERSION;
+
+                $result = [
+                    'protocolVersion' => $agreed,
+                    'capabilities'    => ['tools' => new \stdClass()],
+                    'serverInfo'      => [
+                        'name'        => SERVER_NAME,
+                        'title'       => SERVER_TITLE,
+                        'version'     => SERVER_VERSION,
+                        'description' => 'SHOPLINE 店铺数据只读 MCP 服务（订单/客户/商品/库存/履约单）。',
+                    ],
+                    'instructions'    => SERVER_INSTRUCTIONS,
+                ];
+                break;
+
+            case 'notifications/initialized':
+                return null;
+
+            case 'tools/list':
+                $result = ['tools' => getToolDefinitions()];
+                break;
+
+            case 'tools/call':
+                $res = executeTool(
+                    (string) ($params['name'] ?? ''),
+                    is_array($params['arguments'] ?? null) ? $params['arguments'] : []
+                );
+
+                $payload = ['content' => [['type' => 'text', 'text' => $res['text']]]];
+                // 输入校验错误 / API 失败 → Tool Execution Error
+                if (!empty($res['isError'])) {
+                    $payload['isError'] = true;
+                }
+                // 结构化结果（2025-11-25 要求根为 JSON 对象）
+                if (array_key_exists('data', $res) && $res['data'] !== null) {
+                    $payload['structuredContent'] = ensureObject($res['data']);
+                }
+                $result = $payload;
+                break;
+
+            case 'ping':
+                $result = new \stdClass();
+                break;
+
+            default:
+                $error = ['code' => ERR_METHOD_NOT_FOUND, 'message' => "Method not found: {$method}"];
+        }
+    } catch (\Throwable $e) {
+        $error = ['code' => ERR_INTERNAL, 'message' => $e->getMessage()];
+    }
+
+    if ($isNotification) {
+        return null;
+    }
+
+    $response = ['jsonrpc' => '2.0', 'id' => $id];
+    if ($error !== null) {
+        $response['error'] = $error;
+    } else {
+        $response['result'] = $result;
+    }
+    return $response;
+}
+
+/**
+ * 保证 structuredContent 的根是 JSON 对象（2025-11-25 的硬性约束）。
+ * 标量 → 包一层；顺序数组 → 包成 {"items": [...]}。
+ */
+function ensureObject($data): array
+{
+    if (!is_array($data)) {
+        return ['value' => $data];
+    }
+    if (array_is_list($data)) {
+        return ['items' => $data];
+    }
+    return $data;
+}
 
 // ============================================================
 // SHOPLINE API 调用封装
@@ -218,7 +356,7 @@ function shoplineRequest(string $path, array $query = []): array
 
     if ($SHOPLINE_SHOP_HANDLE === '') {
         return ['ok' => false, 'status' => 0, 'data' => null, 'raw' => '', 'link' => '',
-                'error' => '未配置店铺 handle。请在 shopline_mcp.php 顶部把 $SHOPLINE_SHOP_HANDLE 填成你的店铺域名前缀（例如后台是 open001.myshopline.com 就填 open001）。'];
+                'error' => '未配置店铺 handle。请把 $SHOPLINE_SHOP_HANDLE 填成你的店铺域名前缀。'];
     }
     if ($SHOPLINE_ACCESS_TOKEN === '') {
         return ['ok' => false, 'status' => 0, 'data' => null, 'raw' => '', 'link' => '',
@@ -250,10 +388,10 @@ function shoplineRequest(string $path, array $query = []): array
         ],
     ]);
 
-    $resp      = curl_exec($ch);
-    $errno     = curl_errno($ch);
-    $curlError = curl_error($ch);
-    $status    = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $resp       = curl_exec($ch);
+    $errno      = curl_errno($ch);
+    $curlError  = curl_error($ch);
+    $status     = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
     curl_close($ch);
 
@@ -276,8 +414,8 @@ function shoplineRequest(string $path, array $query = []): array
     if ($status < 200 || $status >= 300) {
         $msg = '';
         if (is_array($data)) {
-            // SHOPLINE 错误体形如 {"errors":"ACCESS_TOKEN is invalid!"}
-            $msg = $data['errors'] ?? $data['message'] ?? $data['error'] ?? $data['error_msg'] ?? json_encode($data, JSON_UNESCAPED_UNICODE);
+            $msg = $data['errors'] ?? $data['message'] ?? $data['error'] ?? $data['error_msg']
+                 ?? json_encode($data, JSON_UNESCAPED_UNICODE);
             if (is_array($msg)) {
                 $msg = json_encode($msg, JSON_UNESCAPED_UNICODE);
             }
@@ -288,7 +426,7 @@ function shoplineRequest(string $path, array $query = []): array
         if ($status === 401) {
             $hint = '（访问令牌无效或已过期，请重新授权获取 access_token）';
         } elseif ($status === 403) {
-            $hint = '（权限不足或店铺不匹配：请确认 $SHOPLINE_SHOP_HANDLE 是本令牌对应的店铺，且应用已开通对应 read_* 权限）';
+            $hint = '（权限不足或店铺不匹配：请确认 handle 是本令牌对应的店铺，且应用已开通对应 read_* 权限）';
         } elseif ($status === 404) {
             $hint = '（资源不存在，或店铺 handle / API 版本配置有误）';
         } elseif ($status === 429) {
@@ -337,13 +475,12 @@ function cleanQuery(array $args, array $allowed): array
 /**
  * 订单查询 + 隐藏订单兜底（列表 / 详情通用）。
  *
- * 注意 SHOPLINE 的 hidden_order 参数语义是「过滤」而非「包含」：
+ * SHOPLINE 的 hidden_order 参数语义是「过滤」而非「包含」：
  *   hidden_order=true        → 只返回隐藏订单
  *   hidden_order=false/不传  → 只返回非隐藏订单
  * 因此不能直接叠加 true（那样会把正常订单全部过滤掉）。
  *
- * 策略：一律先按原条件查非隐藏单；若 0 条且允许兜底（调用方未显式指定
- * hidden_order），再自动补查一次隐藏订单。补查命中与否，返回结果均不做额外标注。
+ * 策略：一律先按原条件查非隐藏单；若 0 条且允许兜底，再自动补查一次隐藏订单。
  *
  * @return array shoplineRequest 的返回结构
  */
@@ -367,39 +504,6 @@ function ordersRequestWithHiddenFallback(array $q, bool $allowAutoRetry): array
     return $r;
 }
 
-/** 组装工具返回文本：一句摘要 + JSON 正文 */
-function formatResult(string $summary, $data, string $link = ''): string
-{
-    global $MAX_OUTPUT_CHARS;
-
-    $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
-    if ($json === false) {
-        $json = '(无法序列化返回数据)';
-    }
-    $truncated = false;
-    if (mb_strlen($json) > $MAX_OUTPUT_CHARS) {
-        $json = mb_substr($json, 0, $MAX_OUTPUT_CHARS);
-        $truncated = true;
-    }
-
-    $out = $summary;
-    $pageInfo = extractPageInfo($link);
-    if ($pageInfo !== '') {
-        $out .= "\n下一页游标 page_info：" . $pageInfo . "（把它作为 page_info 参数再次调用即可翻页）";
-    }
-    $out .= "\n\n" . $json;
-    if ($truncated) {
-        $out .= "\n\n...（返回内容过长已截断，请用 limit / 时间范围 / 筛选条件缩小结果）";
-    }
-    return $out;
-}
-
-/** 统一的失败输出 */
-function failText(array $r): string
-{
-    return '调用失败：' . ($r['error'] ?? '未知错误');
-}
-
 /** 统计一个列表返回了多少条 */
 function countList(?array $data, array $keys): int
 {
@@ -415,6 +519,70 @@ function countList(?array $data, array $keys): int
 }
 
 // ============================================================
+// 工具返回结构（text + data + isError）
+// ============================================================
+
+/**
+ * 组装工具返回：content 文本（摘要 + JSON） + structuredContent（原始数据）
+ *
+ * structuredContent 不受 $MAX_OUTPUT_CHARS 限制，因此完整数据始终可被程序解析。
+ */
+function formatResult(string $summary, $data, string $link = ''): array
+{
+    global $MAX_OUTPUT_CHARS;
+
+    $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+    if ($json === false) {
+        $json = '(无法序列化返回数据)';
+    }
+
+    $truncated = false;
+    if (mb_strlen($json) > $MAX_OUTPUT_CHARS) {
+        $json      = mb_substr($json, 0, $MAX_OUTPUT_CHARS);
+        $truncated = true;
+    }
+
+    $out      = $summary;
+    $pageInfo = extractPageInfo($link);
+    if ($pageInfo !== '') {
+        $out .= "\n下一页游标 page_info：{$pageInfo}（把它作为 page_info 参数再次调用即可翻页）";
+    }
+    $out .= "\n\n" . $json;
+    if ($truncated) {
+        $out .= "\n\n...（返回内容过长已截断，请用 limit / 时间范围 / 筛选条件缩小结果）";
+    }
+
+    // structuredContent：原始数据 + 分页游标（完整、不截断）
+    $sc = is_array($data) ? $data : ['data' => $data];
+    if ($pageInfo !== '') {
+        $sc['_page_info'] = $pageInfo;
+    }
+
+    return ['text' => $out, 'data' => $sc, 'isError' => false];
+}
+
+/** API 调用失败的统一输出（isError = true） */
+function failText(array $r): array
+{
+    $msg = (string) ($r['error'] ?? '未知错误');
+    return [
+        'text'    => '调用失败：' . $msg,
+        'data'    => ['error' => ['message' => $msg, 'status' => $r['status'] ?? null]],
+        'isError' => true,
+    ];
+}
+
+/** 输入校验错误的统一输出（2025-11-25：按 Tool Execution Error 返回） */
+function toolError(string $message): array
+{
+    return [
+        'text'    => $message,
+        'data'    => ['error' => ['message' => $message]],
+        'isError' => true,
+    ];
+}
+
+// ============================================================
 // 工具定义
 // ============================================================
 function getToolDefinitions(): array
@@ -422,13 +590,16 @@ function getToolDefinitions(): array
     return [
         [
             'name' => 'shopline_ping',
+            'title' => 'SHOPLINE 连通性自检',
             'description' => 'SHOPLINE 连通性与凭据自检。调用一次订单查询（orders.json）验证 handle、访问令牌和 API 版本是否配置正确。部署后或排查问题时应先调用它。',
-            'inputSchema' => ['type' => 'object', 'properties' => new \stdClass(), 'required' => []],
+            'inputSchema' => ['$schema' => JSON_SCHEMA_DIALECT, 'type' => 'object', 'properties' => new \stdClass(), 'required' => []],
         ],
         [
             'name' => 'list_orders',
+            'title' => '查询订单列表',
             'description' => '查询 SHOPLINE 订单列表。支持按创建时间、更新时间、订单状态、支付状态、履约状态、订单号、邮箱等条件筛选。当用户询问"最近订单""某天的订单""未发货订单""某客户订单"时使用。注意：SHOPLINE 存在「隐藏订单」（hidden_order），默认不返回；本工具一律先查非隐藏订单，若结果为空再自动补查隐藏订单，避免漏单。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'created_at_min'     => ['type' => 'string', 'description' => '创建时间下限，ISO 8601，如 2026-10-01T00:00:00+08:00'],
@@ -441,7 +612,7 @@ function getToolDefinitions(): array
                     'financial_status'   => ['type' => 'string', 'description' => '支付状态，如 paid / pending / refunded / partially_refunded'],
                     'fulfillment_status' => ['type' => 'string', 'description' => '履约状态，如 unfulfilled / partial / fulfilled'],
                     'ids'                => ['type' => 'string', 'description' => '订单 ID 列表，多个用英文逗号分隔'],
-                    'name'               => ['type' => 'string', 'description' => '订单号，如 #1001'],
+                    'name'               => ['type' => 'string', 'description' => '订单号，如 MG3812'],
                     'email'              => ['type' => 'string', 'description' => '买家邮箱'],
                     'buyer_id'           => ['type' => 'string', 'description' => '买家 ID'],
                     'location'           => ['type' => 'string', 'description' => '订单来源地区'],
@@ -458,8 +629,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'get_order',
+            'title' => '查询订单详情',
             'description' => '根据订单 ID 或订单号查询订单完整详情（含商品明细、金额、收货地址、支付与履约信息）。order_id 传纯数字视为订单 ID，传含字母的订单号（如 MG3812）会自动识别。若该订单为隐藏订单，会自动补查。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'order_id'     => ['type' => 'string', 'description' => '订单 ID 或订单号（必填）。纯数字（如 21071356717618744607449368）按订单 ID 查；含字母（如 MG3812）按订单号查，工具会自动识别。'],
@@ -470,8 +643,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'list_products',
+            'title' => '查询商品列表',
             'description' => '查询 SHOPLINE 商品列表。支持按标题、状态、厂商、handle、商品 ID、集合、创建/更新时间等筛选。当用户询问"有哪些商品""某商品的库存/SKU""上下架情况"时使用。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'title'            => ['type' => 'string', 'description' => '商品标题（模糊匹配）'],
@@ -495,8 +670,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'get_product',
+            'title' => '查询商品详情',
             'description' => '根据商品 ID 查询单个商品的完整详情（含所有规格 variant、SKU、价格、库存、图片）。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'product_id' => ['type' => 'string', 'description' => '商品 ID（必填）'],
@@ -506,8 +683,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'list_customers',
+            'title' => '查询客户列表',
             'description' => '查询 SHOPLINE 客户列表。支持按创建/更新时间、客户 ID 筛选。当用户询问"有多少客户""某客户信息"时使用。注意：客户数据含隐私信息，请合规使用。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'created_at_min' => ['type' => 'string', 'description' => '创建时间下限，ISO 8601'],
@@ -524,8 +703,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'get_customer',
+            'title' => '查询客户详情',
             'description' => '根据客户 ID 查询单个客户的完整详情（联系方式、地址、消费统计等）。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'customer_id' => ['type' => 'string', 'description' => '客户 ID（必填）'],
@@ -535,13 +716,16 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'list_locations',
+            'title' => '查询库存地点',
             'description' => '查询店铺下所有库存地点（仓库/门店）。注意：该接口需要「地点读取」权限，若返回 403 说明应用未开通，此时可从订单数据里的 locations 字段获取 location_id。',
-            'inputSchema' => ['type' => 'object', 'properties' => new \stdClass(), 'required' => []],
+            'inputSchema' => ['$schema' => JSON_SCHEMA_DIALECT, 'type' => 'object', 'properties' => new \stdClass(), 'required' => []],
         ],
         [
             'name' => 'get_inventory_levels',
+            'title' => '查询库存数量',
             'description' => '查询指定库存单位（inventory_item_id）的可用库存数量。inventory_item_ids 为必填。当用户询问"某商品还有多少库存"时使用。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'inventory_item_ids' => ['type' => 'string', 'description' => '库存单位 ID，必填，多个用英文逗号分隔'],
@@ -552,8 +736,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'list_inventory_items',
+            'title' => '查询库存单位',
             'description' => '查询库存单位列表（SKU 维度，含 sku、tracked 等）。ids 为必填。用于把商品规格与库存记录关联起来。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'ids'       => ['type' => 'string', 'description' => '库存单位 ID 列表，必填，多个用逗号分隔'],
@@ -565,8 +751,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'list_fulfillment_orders',
+            'title' => '查询履约单列表',
             'description' => '查询履约单（发货单）列表。location_ids 为必填。当用户询问"待发货订单""某地点的待处理履约单""履约进度"时使用。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'location_ids'      => ['type' => 'string', 'description' => '地点 ID，必填，多个用英文逗号分隔'],
@@ -581,8 +769,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'shopline_api_request',
+            'title' => '只读通用请求',
             'description' => '只读通用请求（兜底工具）。当上面的专用工具覆盖不到某个只读接口时使用，只能访问白名单内的路径，且必须是 GET。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'path'  => ['type' => 'string', 'description' => '接口路径，不含版本号，如 orders.json、products/products.json'],
@@ -597,7 +787,9 @@ function getToolDefinitions(): array
 // ============================================================
 // 工具执行
 // ============================================================
-function executeTool(string $name, array $args): string
+
+/** @return array{text:string,data:mixed,isError:bool} */
+function executeTool(string $name, array $args): array
 {
     return match ($name) {
         'shopline_ping'           => toolPing(),
@@ -616,18 +808,26 @@ function executeTool(string $name, array $args): string
     };
 }
 
-function toolPing(): string
+function toolPing(): array
 {
-    // 用 orders.json 做自检（read_orders 权限，本应用已开通）
     $r = shoplineRequest('orders.json', ['limit' => 1]);
     if (!$r['ok']) {
-        return "SHOPLINE 自检失败。\n" . $r['error'];
+        $msg = 'SHOPLINE 自检失败。' . ($r['error'] ?? '');
+        return [
+            'text'    => $msg,
+            'data'    => ['ok' => false, 'error' => ['message' => $r['error'] ?? '']],
+            'isError' => true,
+        ];
     }
     $n = countList($r['data'], ['orders', 'items', 'data']);
-    return "SHOPLINE 自检通过：handle、访问令牌、API 版本均正常，成功读到订单数据（本次返回 {$n} 笔）。";
+    return [
+        'text'    => "SHOPLINE 自检通过：handle、访问令牌、API 版本均正常，成功读到订单数据（本次返回 {$n} 笔）。",
+        'data'    => ['ok' => true, 'orders_returned' => $n],
+        'isError' => false,
+    ];
 }
 
-function toolListOrders(array $args): string
+function toolListOrders(array $args): array
 {
     $allowed = ['created_at_min', 'created_at_max', 'updated_at_min', 'updated_at_max',
         'order_at_min', 'order_at_max', 'status', 'financial_status', 'fulfillment_status',
@@ -638,7 +838,6 @@ function toolListOrders(array $args): string
     $q['limit'] = min((int) ($q['limit'] ?? 20), 100);
 
     // 一律先查非隐藏单；若未显式指定 hidden_order 且查不到，再自动补查隐藏单
-    // （两者无法一次同时返回）
     $autoRetry = !isset($q['hidden_order']);
     $r = ordersRequestWithHiddenFallback($q, $autoRetry);
     if (!$r['ok']) {
@@ -648,19 +847,18 @@ function toolListOrders(array $args): string
     return formatResult("查询到 {$n} 笔订单（limit={$q['limit']}）。", $r['data'], $r['link']);
 }
 
-function toolGetOrder(array $args): string
+function toolGetOrder(array $args): array
 {
     $id = trim((string) ($args['order_id'] ?? ''));
     if ($id === '') {
-        return '错误：缺少 order_id 参数';
+        return toolError('错误：缺少 order_id 参数');
     }
     $q = cleanQuery($args, ['hidden_order']);
 
     // 自动识别参数类型：纯数字 → 订单 ID（用 ids）；含字母等 → 订单号（用 name）
-    // SHOPLINE 的 ids 只认数字订单 ID，订单号必须通过 name 传。
     if (preg_match('/^\d+$/', $id)) {
-        $q['ids']  = $id;
-        $label     = "订单 ID {$id}";
+        $q['ids'] = $id;
+        $label    = "订单 ID {$id}";
     } else {
         $q['name'] = $id;
         $label     = "订单号 {$id}";
@@ -674,12 +872,17 @@ function toolGetOrder(array $args): string
     }
     $n = countList($r['data'], ['orders', 'items', 'data']);
     if ($n === 0) {
-        return "未找到{$label} 对应的订单";
+        // 空结果不是错误：isError 保持 false，structuredContent 为 {"orders":[]}
+        return [
+            'text'    => "未找到{$label} 对应的订单",
+            'data'    => is_array($r['data']) ? $r['data'] : ['orders' => []],
+            'isError' => false,
+        ];
     }
     return formatResult("{$label} 详情：", $r['data']);
 }
 
-function toolListProducts(array $args): string
+function toolListProducts(array $args): array
 {
     $allowed = ['title', 'status', 'vendor', 'handle', 'ids', 'collection_id', 'product_category',
         'created_at_min', 'created_at_max', 'updated_at_min', 'updated_at_max',
@@ -695,11 +898,11 @@ function toolListProducts(array $args): string
     return formatResult("查询到 {$n} 个商品（limit={$q['limit']}）。", $r['data'], $r['link']);
 }
 
-function toolGetProduct(array $args): string
+function toolGetProduct(array $args): array
 {
     $id = trim((string) ($args['product_id'] ?? ''));
     if ($id === '') {
-        return '错误：缺少 product_id 参数';
+        return toolError('错误：缺少 product_id 参数');
     }
     $r = shoplineRequest('products/' . rawurlencode($id) . '.json');
     if (!$r['ok']) {
@@ -708,7 +911,7 @@ function toolGetProduct(array $args): string
     return formatResult("商品 {$id} 详情：", $r['data']);
 }
 
-function toolListCustomers(array $args): string
+function toolListCustomers(array $args): array
 {
     $allowed = ['created_at_min', 'created_at_max', 'updated_at_min', 'updated_at_max',
         'ids', 'limit', 'since_id', 'page_info'];
@@ -723,11 +926,11 @@ function toolListCustomers(array $args): string
     return formatResult("查询到 {$n} 个客户（limit={$q['limit']}）。注意客户数据含隐私信息，请合规使用。", $r['data'], $r['link']);
 }
 
-function toolGetCustomer(array $args): string
+function toolGetCustomer(array $args): array
 {
     $id = trim((string) ($args['customer_id'] ?? ''));
     if ($id === '') {
-        return '错误：缺少 customer_id 参数';
+        return toolError('错误：缺少 customer_id 参数');
     }
     $r = shoplineRequest('customers/v2/' . rawurlencode($id) . '.json');
     if (!$r['ok']) {
@@ -736,7 +939,7 @@ function toolGetCustomer(array $args): string
     return formatResult("客户 {$id} 详情：", $r['data']);
 }
 
-function toolListLocations(): string
+function toolListLocations(): array
 {
     $r = shoplineRequest('locations/list.json');
     if (!$r['ok']) {
@@ -746,11 +949,11 @@ function toolListLocations(): string
     return formatResult("店铺下共有 {$n} 个库存地点：", $r['data']);
 }
 
-function toolGetInventoryLevels(array $args): string
+function toolGetInventoryLevels(array $args): array
 {
     $q = cleanQuery($args, ['inventory_item_ids', 'location_ids']);
     if (empty($q['inventory_item_ids'])) {
-        return '错误：inventory_item_ids 为必填（SHOPLINE 要求必须指定库存单位 ID，可用 list_products / get_product 拿到 variant 对应的 inventory_item_id）';
+        return toolError('错误：inventory_item_ids 为必填（SHOPLINE 要求必须指定库存单位 ID，可用 list_products / get_product 拿到 variant 对应的 inventory_item_id）');
     }
     $r = shoplineRequest('inventory_levels.json', $q);
     if (!$r['ok']) {
@@ -760,11 +963,11 @@ function toolGetInventoryLevels(array $args): string
     return formatResult("查询到 {$n} 条库存记录：", $r['data']);
 }
 
-function toolListInventoryItems(array $args): string
+function toolListInventoryItems(array $args): array
 {
     $q = cleanQuery($args, ['ids', 'limit', 'page_info']);
     if (empty($q['ids'])) {
-        return '错误：ids 为必填（SHOPLINE 要求必须指定库存单位 ID）';
+        return toolError('错误：ids 为必填（SHOPLINE 要求必须指定库存单位 ID）');
     }
     $q['limit'] = min((int) ($q['limit'] ?? 20), 250);
 
@@ -776,11 +979,11 @@ function toolListInventoryItems(array $args): string
     return formatResult("查询到 {$n} 个库存单位：", $r['data'], $r['link']);
 }
 
-function toolListFulfillmentOrders(array $args): string
+function toolListFulfillmentOrders(array $args): array
 {
     $q = cleanQuery($args, ['location_ids', 'assignment_status', 'order_id', 'limit', 'since_id', 'page_info']);
     if (empty($q['location_ids'])) {
-        return '错误：location_ids 为必填（SHOPLINE 要求必须指定地点 ID，可从订单数据的 locations 字段获取）';
+        return toolError('错误：location_ids 为必填（SHOPLINE 要求必须指定地点 ID，可从订单数据的 locations 字段获取）');
     }
     $q['limit'] = min((int) ($q['limit'] ?? 20), 250);
 
@@ -792,11 +995,11 @@ function toolListFulfillmentOrders(array $args): string
     return formatResult("查询到 {$n} 张履约单：", $r['data'], $r['link']);
 }
 
-function toolApiRequest(array $args): string
+function toolApiRequest(array $args): array
 {
     $path = trim((string) ($args['path'] ?? ''));
     if ($path === '') {
-        return '错误：缺少 path 参数';
+        return toolError('错误：缺少 path 参数');
     }
     $path = ltrim($path, '/');
 
@@ -811,8 +1014,8 @@ function toolApiRequest(array $args): string
         || preg_match('#^customers/v2/[A-Za-z0-9_\-]+\.json$#', $path);
 
     if (!$isWhitelisted) {
-        return "错误：路径 {$path} 不在只读白名单内。\n允许的路径：" . implode('、', $whitelist)
-            . '，以及 products/{id}.json、customers/v2/{id}.json。';
+        return toolError("错误：路径 {$path} 不在只读白名单内。\n允许的路径：" . implode('、', $whitelist)
+            . '，以及 products/{id}.json、customers/v2/{id}.json。');
     }
 
     $query = is_array($args['query'] ?? null) ? $args['query'] : [];
@@ -821,64 +1024,4 @@ function toolApiRequest(array $args): string
         return failText($r);
     }
     return formatResult("请求 {$path} 成功：", $r['data'], $r['link']);
-}
-
-// ============================================================
-// JSON-RPC 协议处理
-// ============================================================
-function handleRequest(array $request): ?array
-{
-    $id      = $request['id'] ?? null;
-    $method  = $request['method'] ?? '';
-    $params  = $request['params'] ?? [];
-    $isNotification = !array_key_exists('id', $request);
-
-    $result = null;
-    $error  = null;
-
-    try {
-        switch ($method) {
-            case 'initialize':
-                $result = [
-                    'protocolVersion' => '2024-11-05',
-                    'capabilities'    => ['tools' => new \stdClass()],
-                    'serverInfo'      => ['name' => 'SHOPLINE_Admin_MCP', 'version' => '1.4.0'],
-                    'instructions'    => 'SHOPLINE 店铺数据只读服务：订单、客户、商品、库存、履约单。先调用 shopline_ping 验证连通性。分页用返回的 page_info 游标。订单查询（列表/详情）一律先查非隐藏订单，若为空再自动补查隐藏订单（hidden_order），避免漏单。',
-                ];
-                break;
-
-            case 'notifications/initialized':
-                return null;
-
-            case 'tools/list':
-                $result = ['tools' => getToolDefinitions()];
-                break;
-
-            case 'tools/call':
-                $text = executeTool($params['name'] ?? '', $params['arguments'] ?? []);
-                $result = ['content' => [['type' => 'text', 'text' => $text]]];
-                break;
-
-            case 'ping':
-                $result = new \stdClass();
-                break;
-
-            default:
-                $error = ['code' => -32601, 'message' => "Method not found: {$method}"];
-        }
-    } catch (\Throwable $e) {
-        $error = ['code' => -32603, 'message' => $e->getMessage()];
-    }
-
-    if ($isNotification) {
-        return null;
-    }
-
-    $response = ['jsonrpc' => '2.0', 'id' => $id];
-    if ($error !== null) {
-        $response['error'] = $error;
-    } else {
-        $response['result'] = $result;
-    }
-    return $response;
 }

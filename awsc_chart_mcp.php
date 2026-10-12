@@ -1,12 +1,24 @@
 <?php
 /**
  * ============================================================================
- * AWSC 通话记录 MCP Server（HTTP 模式）
+ * AWSC 通话记录 MCP Server（HTTP 模式）—— MCP 协议 2025-11-25
  * ============================================================================
  *
  * 【这个文件是干什么的】
  * 把 wachat.csr_sip_log 表封装成 MCP 服务，让 AI 客户端（Claude Desktop、Cursor、
  * 你的知识库系统等）能通过标准 HTTP 接口查询通话记录、录音、转录文本和统计数据。
+ *
+ * 【MCP 协议版本：2025-11-25（legacy / 握手式）】
+ *   本文件按 MCP 2025-11-25 修订版实现，要点：
+ *     1. 保留 initialize 握手与 notifications/initialized 通知；保留 ping。
+ *     2. 版本协商：initialize 时若客户端请求的版本受支持，则回同版本；
+ *        否则回本服务支持的最新版本（2025-11-25）。
+ *     3. tools/call 同时返回 content（文本）与 structuredContent（结构化数据）；
+ *        注意 structuredContent 的**根必须是 JSON 对象**（2025-11-25 的约束）。
+ *     4. 输入校验错误（缺参数等）按 Tool Execution Error 返回，即 isError=true，
+ *        而不是协议级 error —— 这样模型能看到错误并自我纠正。
+ *     5. 握手之后，客户端应在所有请求上带 MCP-Protocol-Version 请求头。
+ *     6. JSON Schema 2020-12 为默认方言（inputSchema 已显式声明 $schema）。
  *
  * 【部署步骤】
  *
@@ -17,12 +29,13 @@
  * 2. 改 Token
  *    找到下面 $MCP_TOKEN 那一行，改成你自己的强随机字符串。
  *
- * 3. 配置 Nginx 传递 Authorization 头（用 Header 传 Token 时才需要）
+ * 3. 配置 Nginx 传递请求头（用 Header 传 Token / 传协议版本头时才需要）
  *    你的环境是宝塔 + PHP 8.2，PHP 处理通过 include enable-php-82.conf 引入。
  *    在站点配置 server { } 块内，include enable-php-82.conf; 之前，加一段：
  *
  *    location = /awsc_chart_mcp.php {
- *        fastcgi_param HTTP_AUTHORIZATION $http_authorization;
+ *        fastcgi_param HTTP_AUTHORIZATION        $http_authorization;
+ *        fastcgi_param HTTP_MCP_PROTOCOL_VERSION $http_mcp_protocol_version;
  *        include enable-php-82.conf;
  *    }
  *
@@ -67,15 +80,6 @@
  *   }
  * }
  *
- * 或者用 URL 参数：
- * {
- *   "mcpServers": {
- *     "awsc-calls": {
- *       "url": "https://download.yixiu-cloud.com/awsc_chart_mcp.php?token=awsc-mcp-2024-secret-token"
- *     }
- *   }
- * }
- *
  * 只支持 stdio 的客户端（如旧版 Claude Desktop），用 mcp-remote 桥接：
  * {
  *   "mcpServers": {
@@ -108,7 +112,7 @@
  *     }
  *   }'
  *
- * PHP 调用示例：
+ * PHP 调用示例（注意：结构化数据在 result.structuredContent，文本在 result.content[0].text）：
  * $ch = curl_init('https://download.yixiu-cloud.com/awsc_chart_mcp.php');
  * curl_setopt_array($ch, [
  *     CURLOPT_POST => true,
@@ -129,7 +133,8 @@
  * ]);
  * $response = curl_exec($ch);
  * $result = json_decode($response, true);
- * echo $result['result']['content'][0]['text'];
+ * $rows  = $result['result']['structuredContent']['calls'];   // 结构化数据
+ * $text  = $result['result']['content'][0]['text'];           // 人类可读文本
  *
  * 【可用的工具】
  *
@@ -142,20 +147,24 @@
  *    - date_to         结束日期 YYYY-MM-DD
  *    - has_recording   是否只看有录音的（true/false）
  *    - limit           返回条数，默认 20，最大 100
+ *    structuredContent: { calls: [...], count: N }
  *
  * 2. get_call_detail
  *    根据 contact_id 查单条通话的完整详情。
  *    参数：contact_id（必填）
+ *    structuredContent: { call: {...} | null }
  *
  * 3. get_call_transcript
  *    获取指定通话的转录文本。
  *    参数：contact_id（必填）
+ *    structuredContent: { contact_id, media_status, transcript_status, is_voicemail, conversation_turns, text }
  *
  * 4. list_transcript_failures
  *    列出转录失败的通话记录（用于排查采集问题）。
  *    - aws_instance    AWS 实例地址（可选）
  *    - hours_back      往前查多少小时，默认 24
  *    - limit           返回条数，默认 20
+ *    structuredContent: { hours_back, failures: [...] }
  *
  * 5. get_call_stats
  *    按项目/坐席/日期统计通话量。
@@ -164,11 +173,12 @@
  *    - date_from       开始日期
  *    - date_to         结束日期
  *    - group_by        统计维度：project / agent / date，默认 project
+ *    structuredContent: { group_by, stats: [...] }
  *
  * 【MCP 协议方法】
  *
  * 客户端会发以下 JSON-RPC 请求：
- * - initialize                  握手
+ * - initialize                  握手（含版本协商）
  * - notifications/initialized   初始化完成通知（无需响应）
  * - tools/list                  获取工具列表
  * - tools/call                  执行工具
@@ -219,13 +229,36 @@ Db::setConfig([
 ]);
 
 // ============================================================
+// MCP 2025-11-25 协议常量
+// ============================================================
+
+const MCP_PROTOCOL_VERSION   = '2025-11-25';
+const MCP_SUPPORTED_VERSIONS = ['2025-11-25'];
+
+const SERVER_NAME    = 'AWSC_Call_MCP';
+const SERVER_TITLE   = 'AWSC 通话记录（只读）';
+const SERVER_VERSION = '2.2.0';
+
+const JSON_SCHEMA_DIALECT = 'https://json-schema.org/draft/2020-12/schema';
+
+const SERVER_INSTRUCTIONS = 'AWSC 通话记录只读服务：通话列表、单条详情、转录文本、转录失败排查、通话统计。'
+    . '时间字段为数据库时间；duration 单位为秒，duration_minutes 单位为分钟。';
+
+// JSON-RPC 错误码
+const ERR_PARSE            = -32700;
+const ERR_INVALID_PARAMS   = -32602;
+const ERR_METHOD_NOT_FOUND = -32601;
+const ERR_INTERNAL         = -32603;
+
+// ============================================================
 // HTTP 入口
 // ============================================================
 header('Content-Type: application/json; charset=utf-8');
 
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     http_response_code(405);
-    echo json_encode(['jsonrpc' => '2.0', 'error' => ['code' => -32600, 'message' => 'Method not allowed']]);
+    echo json_encode(['jsonrpc' => '2.0', 'id' => null,
+        'error' => ['code' => -32600, 'message' => 'Method not allowed']]);
     exit;
 }
 
@@ -248,25 +281,160 @@ $providedToken = $tokenFromHeader !== '' ? $tokenFromHeader : $tokenFromUrl;
 // 如果提供了 Token，必须匹配；如果没提供，直接放行
 if ($providedToken !== '' && !hash_equals($MCP_TOKEN, $providedToken)) {
     http_response_code(401);
-    echo json_encode(['jsonrpc' => '2.0', 'error' => ['code' => -32000, 'message' => 'Unauthorized: token mismatch']]);
+    echo json_encode(['jsonrpc' => '2.0', 'id' => null,
+        'error' => ['code' => -32000, 'message' => 'Unauthorized: token mismatch']]);
     exit;
 }
 
 $rawInput = file_get_contents('php://input');
 $request = json_decode($rawInput, true);
 
-if ($request === null || !is_array($request)) {
+if (!is_array($request)) {
     http_response_code(400);
-    echo json_encode(['jsonrpc' => '2.0', 'error' => ['code' => -32700, 'message' => 'Parse error']]);
+    echo json_encode(['jsonrpc' => '2.0', 'id' => null,
+        'error' => ['code' => ERR_PARSE, 'message' => 'Parse error']]);
     exit;
 }
 
-$response = handleRequest($request);
+// 2025-11-25：握手之后客户端应在每个请求上带 MCP-Protocol-Version 头
+$hdrVersion = $_SERVER['HTTP_MCP_PROTOCOL_VERSION'] ?? '';
+
+$response = handleRequest($request, $hdrVersion);
 
 if ($response !== null) {
-    echo json_encode($response, JSON_UNESCAPED_UNICODE);
+    echo json_encode($response, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 }
 exit;
+
+// ============================================================
+// MCP 协议层（2025-11-25，握手式）
+// ============================================================
+
+/**
+ * 处理一次 JSON-RPC 请求
+ *
+ * @param array  $request    JSON-RPC 请求体
+ * @param string $hdrVersion MCP-Protocol-Version 请求头
+ * @return array|null        通知类请求返回 null（不响应）
+ */
+function handleRequest(array $request, string $hdrVersion = ''): ?array
+{
+    $id     = $request['id'] ?? null;
+    $method = (string) ($request['method'] ?? '');
+    $params = is_array($request['params'] ?? null) ? $request['params'] : [];
+
+    $isNotification = !array_key_exists('id', $request);
+
+    // 协议版本头校验（initialize 之后才有意义；缺失则宽松放行）
+    if ($method !== 'initialize' && $hdrVersion !== ''
+        && !in_array($hdrVersion, MCP_SUPPORTED_VERSIONS, true)) {
+        return [
+            'jsonrpc' => '2.0',
+            'id'      => $id,
+            'error'   => [
+                'code'    => ERR_INVALID_PARAMS,
+                'message' => 'Unsupported MCP-Protocol-Version header',
+                'data'    => ['supported' => MCP_SUPPORTED_VERSIONS, 'requested' => $hdrVersion],
+            ],
+        ];
+    }
+
+    $result = null;
+    $error  = null;
+
+    try {
+        switch ($method) {
+            case 'initialize':
+                // 版本协商：客户端版本受支持则回同版本，否则回本服务最新版本
+                $clientVersion = (string) ($params['protocolVersion'] ?? '');
+                $agreed = in_array($clientVersion, MCP_SUPPORTED_VERSIONS, true)
+                    ? $clientVersion
+                    : MCP_PROTOCOL_VERSION;
+
+                $result = [
+                    'protocolVersion' => $agreed,
+                    'capabilities'    => ['tools' => new \stdClass()],
+                    'serverInfo'      => [
+                        'name'        => SERVER_NAME,
+                        'title'       => SERVER_TITLE,
+                        'version'     => SERVER_VERSION,
+                        'description' => 'AWSC 通话记录只读 MCP 服务（通话/录音/转录/统计）。',
+                    ],
+                    'instructions'    => SERVER_INSTRUCTIONS,
+                ];
+                break;
+
+            case 'notifications/initialized':
+                return null;
+
+            case 'tools/list':
+                $result = ['tools' => getToolDefinitions()];
+                break;
+
+            case 'tools/call':
+                $res = executeTool(
+                    (string) ($params['name'] ?? ''),
+                    is_array($params['arguments'] ?? null) ? $params['arguments'] : []
+                );
+
+                $payload = ['content' => [['type' => 'text', 'text' => $res['text']]]];
+                // 输入校验错误 / 查询失败 → Tool Execution Error
+                if (!empty($res['isError'])) {
+                    $payload['isError'] = true;
+                }
+                // 结构化结果（2025-11-25 要求根为 JSON 对象）
+                if (array_key_exists('data', $res) && $res['data'] !== null) {
+                    $payload['structuredContent'] = ensureObject($res['data']);
+                }
+                $result = $payload;
+                break;
+
+            case 'ping':
+                $result = new \stdClass();
+                break;
+
+            default:
+                $error = ['code' => ERR_METHOD_NOT_FOUND, 'message' => "Method not found: {$method}"];
+        }
+    } catch (\Throwable $e) {
+        $error = ['code' => ERR_INTERNAL, 'message' => $e->getMessage()];
+    }
+
+    if ($isNotification) return null;
+
+    $response = ['jsonrpc' => '2.0', 'id' => $id];
+    if ($error !== null) {
+        $response['error'] = $error;
+    } else {
+        $response['result'] = $result;
+    }
+    return $response;
+}
+
+/**
+ * 保证 structuredContent 的根是 JSON 对象（2025-11-25 的硬性约束）。
+ * 标量 → 包一层；顺序数组 → 包成 {"items": [...]}。
+ */
+function ensureObject($data): array
+{
+    if (!is_array($data)) {
+        return ['value' => $data];
+    }
+    if (array_is_list($data)) {
+        return ['items' => $data];
+    }
+    return $data;
+}
+
+/** 输入校验错误的统一输出（2025-11-25：按 Tool Execution Error 返回） */
+function toolError(string $message): array
+{
+    return [
+        'text'    => $message,
+        'data'    => ['error' => ['message' => $message]],
+        'isError' => true,
+    ];
+}
 
 // ============================================================
 // 工具定义
@@ -276,8 +444,10 @@ function getToolDefinitions(): array
     return [
         [
             'name' => 'query_calls',
+            'title' => '查询通话记录',
             'description' => '查询亚马逊 Connect 通话记录。支持按项目、坐席、客户电话、时间范围、是否有录音等条件筛选。当用户询问某段时间的通话、某坐席的通话记录时使用。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'project_id' => ['type' => 'string', 'description' => '项目 ID'],
@@ -293,8 +463,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'get_call_detail',
+            'title' => '查询通话详情',
             'description' => '根据 contact_id 获取单条通话的完整详情，包括录音 URL、转录状态、通话时长、客户信息等。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'contact_id' => ['type' => 'string', 'description' => '通话记录 ID']
@@ -304,8 +476,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'get_call_transcript',
+            'title' => '获取通话转录文本',
             'description' => '获取指定通话的转录文本（对话内容）。如果尚未转录完成，会返回状态说明。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'contact_id' => ['type' => 'string', 'description' => '通话记录 ID']
@@ -315,8 +489,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'list_transcript_failures',
+            'title' => '列出转录失败记录',
             'description' => '列出转录状态异常的通话记录（如 ResourceNotFoundException），用于排查采集失败的通话。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'aws_instance' => ['type' => 'string', 'description' => 'AWS 实例地址'],
@@ -328,8 +504,10 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'get_call_stats',
+            'title' => '通话量统计',
             'description' => '按项目或坐席统计通话量、总时长、平均时长等指标。当用户询问“某项目今天打了多少电话”、“某坐席的通话统计”时使用。',
             'inputSchema' => [
+                '$schema' => JSON_SCHEMA_DIALECT,
                 'type' => 'object',
                 'properties' => [
                     'project_id' => ['type' => 'string', 'description' => '项目 ID'],
@@ -347,7 +525,9 @@ function getToolDefinitions(): array
 // ============================================================
 // 工具执行
 // ============================================================
-function executeTool(string $name, array $args): string
+
+/** @return array{text:string,data:mixed,isError:bool} */
+function executeTool(string $name, array $args): array
 {
     return match ($name) {
         'query_calls'              => toolQueryCalls($args),
@@ -359,7 +539,7 @@ function executeTool(string $name, array $args): string
     };
 }
 
-function toolQueryCalls(array $args): string
+function toolQueryCalls(array $args): array
 {
     $query = Db::connect('db_wachat')->table('csr_sip_log');
 
@@ -391,7 +571,11 @@ function toolQueryCalls(array $args): string
         ->toArray();
 
     if (empty($rows)) {
-        return '没有找到符合条件的通话记录';
+        return [
+            'text'    => '没有找到符合条件的通话记录',
+            'data'    => ['calls' => [], 'count' => 0],
+            'isError' => false,
+        ];
     }
 
     $lines = ["找到 " . count($rows) . " 条通话记录："];
@@ -410,14 +594,19 @@ function toolQueryCalls(array $args): string
             $r['disconnectTimestamp']
         );
     }
-    return implode("\n", $lines);
+
+    return [
+        'text'    => implode("\n", $lines),
+        'data'    => ['calls' => $rows, 'count' => count($rows)],
+        'isError' => false,
+    ];
 }
 
-function toolGetCallDetail(array $args): string
+function toolGetCallDetail(array $args): array
 {
     $contactId = $args['contact_id'] ?? '';
     if ($contactId === '') {
-        return '错误：缺少 contact_id 参数';
+        return toolError('错误：缺少 contact_id 参数');
     }
 
     $row = Db::connect('db_wachat')->table('csr_sip_log')
@@ -425,7 +614,11 @@ function toolGetCallDetail(array $args): string
         ->find();
 
     if (!$row) {
-        return "未找到 contact_id 为 {$contactId} 的通话记录";
+        return [
+            'text'    => "未找到 contact_id 为 {$contactId} 的通话记录",
+            'data'    => ['call' => null],
+            'isError' => false,
+        ];
     }
 
     $fields = [
@@ -461,14 +654,19 @@ function toolGetCallDetail(array $args): string
             $lines[] = "  {$label}：{$value}";
         }
     }
-    return implode("\n", $lines);
+
+    return [
+        'text'    => implode("\n", $lines),
+        'data'    => ['call' => $row],
+        'isError' => false,
+    ];
 }
 
-function toolGetCallTranscript(array $args): string
+function toolGetCallTranscript(array $args): array
 {
     $contactId = $args['contact_id'] ?? '';
     if ($contactId === '') {
-        return '错误：缺少 contact_id 参数';
+        return toolError('错误：缺少 contact_id 参数');
     }
 
     $row = Db::connect('db_wachat')->table('csr_sip_log')
@@ -477,26 +675,55 @@ function toolGetCallTranscript(array $args): string
         ->find();
 
     if (!$row) {
-        return "未找到 contact_id 为 {$contactId} 的通话记录";
+        return [
+            'text'    => "未找到 contact_id 为 {$contactId} 的通话记录",
+            'data'    => ['call' => null],
+            'isError' => false,
+        ];
     }
 
+    $base = [
+        'contact_id'         => $contactId,
+        'media_status'       => $row['mediaStatus'],
+        'transcript_status'  => $row['transcriptStatus'],
+        'is_voicemail'       => (bool) $row['is_voicemail'],
+        'conversation_turns' => $row['conversation_turns'],
+    ];
+
     if ($row['mediaStatus'] !== 'AVAILABLE') {
-        return "该通话没有录音，无法提供转录文本（mediaStatus: {$row['mediaStatus']}）";
+        return [
+            'text'    => "该通话没有录音，无法提供转录文本（mediaStatus: {$row['mediaStatus']}）",
+            'data'    => $base + ['available' => false, 'text' => null],
+            'isError' => false,
+        ];
     }
 
     if ($row['transcriptStatus'] !== 'COMPLETED') {
-        return "转录尚未完成，当前状态：{$row['transcriptStatus']}";
+        return [
+            'text'    => "转录尚未完成，当前状态：{$row['transcriptStatus']}",
+            'data'    => $base + ['available' => false, 'text' => null],
+            'isError' => false,
+        ];
     }
 
     if (empty($row['recordingText'])) {
-        return "转录状态为 COMPLETED，但文本为空";
+        return [
+            'text'    => "转录状态为 COMPLETED，但文本为空",
+            'data'    => $base + ['available' => true, 'text' => ''],
+            'isError' => false,
+        ];
     }
 
     $header = "通话 {$contactId} 转录文本（对话轮次：{$row['conversation_turns']}，是否留言：" . ($row['is_voicemail'] ? '是' : '否') . "）：";
-    return $header . "\n" . $row['recordingText'];
+
+    return [
+        'text'    => $header . "\n" . $row['recordingText'],
+        'data'    => $base + ['available' => true, 'text' => $row['recordingText']],
+        'isError' => false,
+    ];
 }
 
-function toolListTranscriptFailures(array $args): string
+function toolListTranscriptFailures(array $args): array
 {
     $hoursBack = min((int)($args['hours_back'] ?? 24), 720);
     $limit = min((int)($args['limit'] ?? 20), 100);
@@ -517,7 +744,11 @@ function toolListTranscriptFailures(array $args): string
         ->toArray();
 
     if (empty($rows)) {
-        return "最近 {$hoursBack} 小时内没有转录失败的记录";
+        return [
+            'text'    => "最近 {$hoursBack} 小时内没有转录失败的记录",
+            'data'    => ['hours_back' => $hoursBack, 'failures' => [], 'count' => 0],
+            'isError' => false,
+        ];
     }
 
     $lines = ["最近 {$hoursBack} 小时内转录失败的记录（共 " . count($rows) . " 条）："];
@@ -532,10 +763,15 @@ function toolListTranscriptFailures(array $args): string
             $r['transcriptStatus'] ?: '空'
         );
     }
-    return implode("\n", $lines);
+
+    return [
+        'text'    => implode("\n", $lines),
+        'data'    => ['hours_back' => $hoursBack, 'failures' => $rows, 'count' => count($rows)],
+        'isError' => false,
+    ];
 }
 
-function toolGetCallStats(array $args): string
+function toolGetCallStats(array $args): array
 {
     $query = Db::connect('db_wachat')->table('csr_sip_log');
 
@@ -569,7 +805,11 @@ function toolGetCallStats(array $args): string
         ->toArray();
 
     if (empty($rows)) {
-        return '没有找到符合条件的统计数据';
+        return [
+            'text'    => '没有找到符合条件的统计数据',
+            'data'    => ['group_by' => $groupBy, 'stats' => [], 'count' => 0],
+            'isError' => false,
+        ];
     }
 
     $label = ['project' => '项目', 'agent' => '坐席', 'date' => '日期'][$groupBy] ?? '分组';
@@ -587,62 +827,10 @@ function toolGetCallStats(array $args): string
             $r['voicemail_count']
         );
     }
-    return implode("\n", $lines);
-}
 
-// ============================================================
-// JSON-RPC 协议处理
-// ============================================================
-function handleRequest(array $request): ?array
-{
-    $id      = $request['id'] ?? null;
-    $method  = $request['method'] ?? '';
-    $params  = $request['params'] ?? [];
-    $isNotification = !array_key_exists('id', $request);
-
-    $result = null;
-    $error  = null;
-
-    try {
-        switch ($method) {
-            case 'initialize':
-                $result = [
-                    'protocolVersion' => '2024-11-05',
-                    'capabilities' => ['tools' => new \stdClass()],
-                    'serverInfo' => ['name' => 'AWSC_Call_MCP', 'version' => '1.0.0']
-                ];
-                break;
-
-            case 'notifications/initialized':
-                return null;
-
-            case 'tools/list':
-                $result = ['tools' => getToolDefinitions()];
-                break;
-
-            case 'tools/call':
-                $text = executeTool($params['name'] ?? '', $params['arguments'] ?? []);
-                $result = ['content' => [['type' => 'text', 'text' => $text]]];
-                break;
-
-            case 'ping':
-                $result = new \stdClass();
-                break;
-
-            default:
-                $error = ['code' => -32601, 'message' => "Method not found: {$method}"];
-        }
-    } catch (\Throwable $e) {
-        $error = ['code' => -32603, 'message' => $e->getMessage()];
-    }
-
-    if ($isNotification) return null;
-
-    $response = ['jsonrpc' => '2.0', 'id' => $id];
-    if ($error !== null) {
-        $response['error'] = $error;
-    } else {
-        $response['result'] = $result;
-    }
-    return $response;
+    return [
+        'text'    => implode("\n", $lines),
+        'data'    => ['group_by' => $groupBy, 'stats' => $rows, 'count' => count($rows)],
+        'isError' => false,
+    ];
 }
