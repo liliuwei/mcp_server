@@ -99,16 +99,17 @@
  *     hidden_order=false / 不传 → 只返回非隐藏订单
  *   （两类订单无法在一次请求中同时返回，所以不能简单地"默认加上 true"，
  *     那样反而会把正常订单全部过滤掉。）
- *   本服务的处理策略：按订单号(name)/订单ID(ids)/关键字(search_content)/交易单ID
- *   (contract_ids) 检索时，先查非隐藏单；若 0 条，再自动补查隐藏单，
- *   从而兼顾正常订单与隐藏订单，避免「查无此单」误判。
- *   如需只查隐藏订单，显式传 hidden_order=true。
- *   另注：orders.json 的 limit 上限为 100（超过会报 500），客户/商品接口上限才是 250。
+ *   本服务的处理策略：订单查询（列表 list_orders 与详情 get_order）一律
+ *   先查非隐藏单；若结果为空，再自动补查隐藏单，从而兼顾两类订单、避免漏单。
+ *   补查命中与否，返回结果不做额外标注。
+ *   如需只查隐藏订单，显式传 hidden_order=true（此时不做兜底）。
+ *   另注：orders.json 的 limit 上限为 100（传 >100 会 500）；商品接口上限 250，
+ *   客户/库存等接口更宽松。各工具已按对应上限自动截断。
  *
  * 【可用工具】
  *   1.  shopline_ping             连通性/凭据自检
  *   2.  list_orders               查询订单列表
- *   3.  get_order                 按订单 ID 查询订单详情
+ *   3.  get_order                 按订单 ID 或订单号查询订单详情
  *   4.  list_products             查询商品列表
  *   5.  get_product               按商品 ID 查询商品详情
  *   6.  list_customers            查询客户列表
@@ -334,30 +335,15 @@ function cleanQuery(array $args, array $allowed): array
 }
 
 /**
- * 判断本次查询是否属于「按唯一标识精确检索订单」
- * 命中时应默认包含隐藏订单（hidden_order=true），否则隐藏订单会被过滤掉，
- * 导致明明存在的订单被误判为「查无此单」。
- */
-function isOrderIdentityQuery(array $q): bool
-{
-    foreach (['name', 'ids', 'search_content', 'contract_ids'] as $key) {
-        if (isset($q[$key]) && $q[$key] !== '') {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * 订单查询 + 隐藏订单兜底。
+ * 订单查询 + 隐藏订单兜底（列表 / 详情通用）。
  *
  * 注意 SHOPLINE 的 hidden_order 参数语义是「过滤」而非「包含」：
  *   hidden_order=true        → 只返回隐藏订单
  *   hidden_order=false/不传  → 只返回非隐藏订单
  * 因此不能直接叠加 true（那样会把正常订单全部过滤掉）。
  *
- * 策略：先按原条件查；若 0 条且允许兜底（调用方未显式指定 hidden_order），
- * 再自动补查一次隐藏订单。补查命中与否，返回结果均不做额外标注。
+ * 策略：一律先按原条件查非隐藏单；若 0 条且允许兜底（调用方未显式指定
+ * hidden_order），再自动补查一次隐藏订单。补查命中与否，返回结果均不做额外标注。
  *
  * @return array shoplineRequest 的返回结构
  */
@@ -403,7 +389,7 @@ function formatResult(string $summary, $data, string $link = ''): string
     }
     $out .= "\n\n" . $json;
     if ($truncated) {
-        $out .= "\n\n...（返回内容过长已截断，请用 limit / fields / 时间范围缩小结果）";
+        $out .= "\n\n...（返回内容过长已截断，请用 limit / 时间范围 / 筛选条件缩小结果）";
     }
     return $out;
 }
@@ -436,12 +422,12 @@ function getToolDefinitions(): array
     return [
         [
             'name' => 'shopline_ping',
-            'description' => 'SHOPLINE 连通性与凭据自检。调用一次「查询地点列表」验证 handle、访问令牌和 API 版本是否配置正确。部署后或排查问题时应先调用它。',
+            'description' => 'SHOPLINE 连通性与凭据自检。调用一次订单查询（orders.json）验证 handle、访问令牌和 API 版本是否配置正确。部署后或排查问题时应先调用它。',
             'inputSchema' => ['type' => 'object', 'properties' => new \stdClass(), 'required' => []],
         ],
         [
             'name' => 'list_orders',
-            'description' => '查询 SHOPLINE 订单列表。支持按创建时间、更新时间、订单状态、支付状态、履约状态、订单号、邮箱等条件筛选。当用户询问"最近订单""某天的订单""未发货订单""某客户订单"时使用。注意：SHOPLINE 存在「隐藏订单」（hidden_order），默认不返回；本工具在按订单号(name)/订单ID(ids)/关键字(search_content)/交易单ID(contract_ids)检索时，若首次查不到会自动补查隐藏订单，避免误判为"查无此单"。',
+            'description' => '查询 SHOPLINE 订单列表。支持按创建时间、更新时间、订单状态、支付状态、履约状态、订单号、邮箱等条件筛选。当用户询问"最近订单""某天的订单""未发货订单""某客户订单"时使用。注意：SHOPLINE 存在「隐藏订单」（hidden_order），默认不返回；本工具一律先查非隐藏订单，若结果为空再自动补查隐藏订单，避免漏单。',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
@@ -462,9 +448,8 @@ function getToolDefinitions(): array
                     'search_content'     => ['type' => 'string', 'description' => '关键字搜索（订单号、客户等）'],
                     'sort_condition'     => ['type' => 'string', 'description' => '排序条件'],
                     'contract_ids'       => ['type' => 'string', 'description' => '合同/交易单 ID，多个用逗号分隔'],
-                    'hidden_order'       => ['type' => 'boolean', 'description' => '隐藏订单过滤开关。SHOPLINE 语义：true=只返回隐藏订单，false/不传=只返回非隐藏订单（无法一次同时返回两类）。一般无需传；按订单号/ID/关键字检索时工具已内置「查不到再补查隐藏单」的兜底。'],
-                    'fields'             => ['type' => 'string', 'description' => '指定返回字段，多个用逗号分隔，可显著减小响应体积'],
-                    'limit'              => ['type' => 'integer', 'description' => '返回条数，默认 20，最大 250', 'default' => 20],
+                    'hidden_order'       => ['type' => 'boolean', 'description' => '隐藏订单过滤开关。SHOPLINE 语义：true=只返回隐藏订单，false/不传=只返回非隐藏订单（无法一次同时返回两类）。一般无需传；本工具已内置「先查非隐藏单，查不到再补查隐藏单」的兜底。'],
+                    'limit'              => ['type' => 'integer', 'description' => '返回条数，默认 20，最大 100（orders 接口上限，超出会报错）', 'default' => 20],
                     'since_id'           => ['type' => 'string', 'description' => '只返回 ID 大于该值的记录（增量拉取）'],
                     'page_info'          => ['type' => 'string', 'description' => '分页游标，上一页返回的 page_info'],
                 ],
@@ -473,12 +458,11 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'get_order',
-            'description' => '根据订单 ID 查询订单完整详情（含商品明细、金额、收货地址、支付与履约信息）。若该订单为隐藏订单，会自动补查。',
+            'description' => '根据订单 ID 或订单号查询订单完整详情（含商品明细、金额、收货地址、支付与履约信息）。order_id 传纯数字视为订单 ID，传含字母的订单号（如 MG3812）会自动识别。若该订单为隐藏订单，会自动补查。',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
-                    'order_id'     => ['type' => 'string', 'description' => '订单 ID（必填）'],
-                    'fields'       => ['type' => 'string', 'description' => '指定返回字段，多个用逗号分隔'],
+                    'order_id'     => ['type' => 'string', 'description' => '订单 ID 或订单号（必填）。纯数字（如 21071356717618744607449368）按订单 ID 查；含字母（如 MG3812）按订单号查，工具会自动识别。'],
                     'hidden_order' => ['type' => 'boolean', 'description' => '隐藏订单过滤开关（true=只查隐藏订单）。一般无需传，工具已内置自动补查。'],
                 ],
                 'required' => ['order_id'],
@@ -502,7 +486,6 @@ function getToolDefinitions(): array
                     'updated_at_min'   => ['type' => 'string', 'description' => '更新时间下限，ISO 8601'],
                     'updated_at_max'   => ['type' => 'string', 'description' => '更新时间上限，ISO 8601'],
                     'order_by'         => ['type' => 'string', 'description' => '排序字段'],
-                    'fields'           => ['type' => 'string', 'description' => '指定返回字段，多个用逗号分隔'],
                     'limit'            => ['type' => 'integer', 'description' => '返回条数，默认 20，最大 250', 'default' => 20],
                     'since_id'         => ['type' => 'string', 'description' => '只返回 ID 大于该值的记录'],
                     'page_info'        => ['type' => 'string', 'description' => '分页游标'],
@@ -517,7 +500,6 @@ function getToolDefinitions(): array
                 'type' => 'object',
                 'properties' => [
                     'product_id' => ['type' => 'string', 'description' => '商品 ID（必填）'],
-                    'fields'     => ['type' => 'string', 'description' => '指定返回字段，多个用逗号分隔'],
                 ],
                 'required' => ['product_id'],
             ],
@@ -533,7 +515,6 @@ function getToolDefinitions(): array
                     'updated_at_min' => ['type' => 'string', 'description' => '更新时间下限，ISO 8601'],
                     'updated_at_max' => ['type' => 'string', 'description' => '更新时间上限，ISO 8601'],
                     'ids'            => ['type' => 'string', 'description' => '客户 ID 列表，多个用逗号分隔'],
-                    'fields'         => ['type' => 'string', 'description' => '指定返回字段，多个用逗号分隔'],
                     'limit'          => ['type' => 'integer', 'description' => '返回条数，默认 20，最大 250', 'default' => 20],
                     'since_id'       => ['type' => 'string', 'description' => '只返回 ID 大于该值的记录'],
                     'page_info'      => ['type' => 'string', 'description' => '分页游标'],
@@ -548,7 +529,6 @@ function getToolDefinitions(): array
                 'type' => 'object',
                 'properties' => [
                     'customer_id' => ['type' => 'string', 'description' => '客户 ID（必填）'],
-                    'fields'      => ['type' => 'string', 'description' => '指定返回字段，多个用逗号分隔'],
                 ],
                 'required' => ['customer_id'],
             ],
@@ -652,13 +632,14 @@ function toolListOrders(array $args): string
     $allowed = ['created_at_min', 'created_at_max', 'updated_at_min', 'updated_at_max',
         'order_at_min', 'order_at_max', 'status', 'financial_status', 'fulfillment_status',
         'ids', 'name', 'email', 'buyer_id', 'location', 'search_content', 'sort_condition',
-        'contract_ids', 'hidden_order', 'fields', 'limit', 'since_id', 'page_info'];
+        'contract_ids', 'hidden_order', 'limit', 'since_id', 'page_info'];
     $q = cleanQuery($args, $allowed);
-    $q['limit'] = min((int) ($q['limit'] ?? 20), 250);
+    // orders.json 的 limit 上限为 100（传 >100 会 500），此处按 100 截断
+    $q['limit'] = min((int) ($q['limit'] ?? 20), 100);
 
-    // 按订单号/订单ID/关键字/交易单ID 检索时，若未显式指定 hidden_order：
-    // 先查非隐藏单，查不到再自动补查隐藏单（两者无法一次同时返回）
-    $autoRetry = !isset($q['hidden_order']) && isOrderIdentityQuery($q);
+    // 一律先查非隐藏单；若未显式指定 hidden_order 且查不到，再自动补查隐藏单
+    // （两者无法一次同时返回）
+    $autoRetry = !isset($q['hidden_order']);
     $r = ordersRequestWithHiddenFallback($q, $autoRetry);
     if (!$r['ok']) {
         return failText($r);
@@ -673,10 +654,19 @@ function toolGetOrder(array $args): string
     if ($id === '') {
         return '错误：缺少 order_id 参数';
     }
-    $q = cleanQuery($args, ['fields', 'hidden_order']);
-    $q['ids'] = $id;
+    $q = cleanQuery($args, ['hidden_order']);
 
-    // 按订单 ID 精确查询：先查非隐藏单，查不到再自动补查隐藏单
+    // 自动识别参数类型：纯数字 → 订单 ID（用 ids）；含字母等 → 订单号（用 name）
+    // SHOPLINE 的 ids 只认数字订单 ID，订单号必须通过 name 传。
+    if (preg_match('/^\d+$/', $id)) {
+        $q['ids']  = $id;
+        $label     = "订单 ID {$id}";
+    } else {
+        $q['name'] = $id;
+        $label     = "订单号 {$id}";
+    }
+
+    // 先查非隐藏单，查不到再自动补查隐藏单
     $autoRetry = !isset($q['hidden_order']);
     $r = ordersRequestWithHiddenFallback($q, $autoRetry);
     if (!$r['ok']) {
@@ -684,16 +674,16 @@ function toolGetOrder(array $args): string
     }
     $n = countList($r['data'], ['orders', 'items', 'data']);
     if ($n === 0) {
-        return "未找到订单 ID 为 {$id} 的订单";
+        return "未找到{$label} 对应的订单";
     }
-    return formatResult("订单 {$id} 详情：", $r['data']);
+    return formatResult("{$label} 详情：", $r['data']);
 }
 
 function toolListProducts(array $args): string
 {
     $allowed = ['title', 'status', 'vendor', 'handle', 'ids', 'collection_id', 'product_category',
         'created_at_min', 'created_at_max', 'updated_at_min', 'updated_at_max',
-        'order_by', 'fields', 'limit', 'since_id', 'page_info'];
+        'order_by', 'limit', 'since_id', 'page_info'];
     $q = cleanQuery($args, $allowed);
     $q['limit'] = min((int) ($q['limit'] ?? 20), 250);
 
@@ -711,12 +701,7 @@ function toolGetProduct(array $args): string
     if ($id === '') {
         return '错误：缺少 product_id 参数';
     }
-    $q = [];
-    if (!empty($args['fields'])) {
-        $q['fields'] = $args['fields'];
-    }
-
-    $r = shoplineRequest('products/' . rawurlencode($id) . '.json', $q);
+    $r = shoplineRequest('products/' . rawurlencode($id) . '.json');
     if (!$r['ok']) {
         return failText($r);
     }
@@ -726,7 +711,7 @@ function toolGetProduct(array $args): string
 function toolListCustomers(array $args): string
 {
     $allowed = ['created_at_min', 'created_at_max', 'updated_at_min', 'updated_at_max',
-        'ids', 'fields', 'limit', 'since_id', 'page_info'];
+        'ids', 'limit', 'since_id', 'page_info'];
     $q = cleanQuery($args, $allowed);
     $q['limit'] = min((int) ($q['limit'] ?? 20), 250);
 
@@ -744,12 +729,7 @@ function toolGetCustomer(array $args): string
     if ($id === '') {
         return '错误：缺少 customer_id 参数';
     }
-    $q = [];
-    if (!empty($args['fields'])) {
-        $q['fields'] = $args['fields'];
-    }
-
-    $r = shoplineRequest('customers/v2/' . rawurlencode($id) . '.json', $q);
+    $r = shoplineRequest('customers/v2/' . rawurlencode($id) . '.json');
     if (!$r['ok']) {
         return failText($r);
     }
@@ -862,8 +842,8 @@ function handleRequest(array $request): ?array
                 $result = [
                     'protocolVersion' => '2024-11-05',
                     'capabilities'    => ['tools' => new \stdClass()],
-                    'serverInfo'      => ['name' => 'SHOPLINE_Admin_MCP', 'version' => '1.1.2'],
-                    'instructions'    => 'SHOPLINE 店铺数据只读服务：订单、客户、商品、库存、履约单。先调用 shopline_ping 验证连通性。分页用返回的 page_info 游标。按订单号/订单ID/关键字检索订单时，若首次查不到会自动补查隐藏订单（hidden_order），避免漏单。',
+                    'serverInfo'      => ['name' => 'SHOPLINE_Admin_MCP', 'version' => '1.4.0'],
+                    'instructions'    => 'SHOPLINE 店铺数据只读服务：订单、客户、商品、库存、履约单。先调用 shopline_ping 验证连通性。分页用返回的 page_info 游标。订单查询（列表/详情）一律先查非隐藏订单，若为空再自动补查隐藏订单（hidden_order），避免漏单。',
                 ];
                 break;
 
