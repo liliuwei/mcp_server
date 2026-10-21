@@ -114,7 +114,7 @@ const MCP_PROTOCOL_VERSION   = '2026-07-28';
 const MCP_SUPPORTED_VERSIONS = ['2026-07-28'];
 
 const SERVER_NAME    = 'SHOPLINE_Admin_MCP';
-const SERVER_VERSION = '2.0.0';
+const SERVER_VERSION = '2.2.2';
 
 // _meta 键名
 const META_VERSION     = 'io.modelcontextprotocol/protocolVersion';
@@ -134,7 +134,7 @@ const ERR_HEADER_MISMATCH     = -32020;  // HeaderMismatchError
 const ERR_UNSUPPORTED_VERSION = -32022;  // UnsupportedProtocolVersionError
 
 const SERVER_INSTRUCTIONS = 'SHOPLINE 店铺数据只读服务：订单、客户、商品、库存、履约单。'
-    . '订单查询（列表/详情）一律先查非隐藏订单，若为空再自动补查隐藏订单（hidden_order），避免漏单。'
+    . '订单查询会自动合并隐藏订单与非隐藏订单，不会漏单；list_orders 返回精简视图，完整详情用 get_order（支持订单号或邮箱）。'
     . '分页用返回的 page_info 游标。建议先调用 shopline_ping 验证连通性。';
 
 // ============================================================
@@ -433,21 +433,15 @@ function cleanQuery(array $args, array $allowed): array
 }
 
 /**
- * 订单查询 + 隐藏订单兜底（列表 / 详情通用）。
- *
- * SHOPLINE 的 hidden_order 参数语义是「过滤」而非「包含」：
- *   hidden_order=true        → 只返回隐藏订单
- *   hidden_order=false/不传  → 只返回非隐藏订单
- * 因此不能直接叠加 true（那样会把正常订单全部过滤掉）。
- *
- * 策略：一律先按原条件查非隐藏单；若 0 条且允许兜底，再自动补查一次隐藏订单。
- *
- * @return array shoplineRequest 的返回结构
+ * 单笔订单查询：先查非隐藏单，查不到再查隐藏单（短路，省一次调用）。
+ * 适用于已知唯一标识（订单号 / 订单 ID）的场景。
  */
-function ordersRequestWithHiddenFallback(array $q, bool $allowAutoRetry): array
+function ordersRequestSingle(array $q): array
 {
-    $r = shoplineRequest('orders.json', $q);
-    if (!$r['ok'] || !$allowAutoRetry) {
+    $q1 = $q;
+    $q1['hidden_order'] = 'false';
+    $r = shoplineRequest('orders.json', $q1);
+    if (!$r['ok']) {
         return $r;
     }
     if (countList($r['data'], ['orders', 'items', 'data']) > 0) {
@@ -462,6 +456,83 @@ function ordersRequestWithHiddenFallback(array $q, bool $allowAutoRetry): array
     }
 
     return $r;
+}
+
+/**
+ * 列表查询：非隐藏单 + 隐藏单「分别查询并合并」，避免漏单。
+ *
+ * SHOPLINE 的 hidden_order 是「过滤」语义（true 只返回隐藏单、false 只返回非隐藏单），
+ * 两类无法在一次请求中同时返回，所以这里查两次再合并。
+ *
+ * 合并规则：按 id 去重 → created_at 倒序 → 截断到 limit。
+ * 分页：带 page_info 时原样透传（游标自带原查询上下文），不做合并。
+ */
+function ordersRequestBoth(array $q): array
+{
+    // 翻页：游标已绑定原查询，直接透传
+    if (!empty($q['page_info'])) {
+        return shoplineRequest('orders.json', $q);
+    }
+
+    $limit = (int) ($q['limit'] ?? 20);
+    if ($limit <= 0) {
+        $limit = 20;
+    }
+
+    $q1 = $q;
+    $q1['hidden_order'] = 'false';
+    $q1['limit'] = $limit;
+
+    $q2 = $q;
+    $q2['hidden_order'] = 'true';
+    $q2['limit'] = $limit;
+
+    $r1 = shoplineRequest('orders.json', $q1);
+    $r2 = shoplineRequest('orders.json', $q2);
+
+    // 两边都失败才算失败；一边成功就用成功的那边
+    if (!$r1['ok'] && !$r2['ok']) {
+        return $r1;
+    }
+
+    $o1 = $r1['ok'] ? ($r1['data']['orders'] ?? []) : [];
+    $o2 = $r2['ok'] ? ($r2['data']['orders'] ?? []) : [];
+
+    // 去重（按订单 id）
+    $seen   = [];
+    $merged = [];
+    foreach (array_merge($o1, $o2) as $o) {
+        $k = (string) ($o['id'] ?? '');
+        if ($k !== '') {
+            if (isset($seen[$k])) {
+                continue;
+            }
+            $seen[$k] = true;
+        }
+        $merged[] = $o;
+    }
+
+    // created_at 倒序（最近的在前）
+    usort($merged, function ($a, $b) {
+        return strcmp((string) ($b['created_at'] ?? ''), (string) ($a['created_at'] ?? ''));
+    });
+
+    // 截断到 limit
+    $truncated = count($merged) > $limit;
+    if ($truncated) {
+        $merged = array_slice($merged, 0, $limit);
+    }
+
+    return [
+        'ok'        => true,
+        'status'    => 200,
+        'data'      => ['orders' => $merged],
+        'raw'       => '',
+        // 合并后两个游标无法统一，故不透传；调用方用时间范围收窄
+        'link'      => '',
+        'error'     => null,
+        'truncated' => $truncated,
+    ];
 }
 
 /** 统计一个列表返回了多少条 */
@@ -479,26 +550,540 @@ function countList(?array $data, array $keys): int
 }
 
 // ============================================================
+// 中文键值对渲染（content.text 用；structuredContent 仍保留原始 JSON）
+// ============================================================
+
+/** 英文字段名 → 中文标签（未收录的回退为原字段名） */
+function fieldLabels(): array
+{
+    static $map = null;
+    if ($map !== null) {
+        return $map;
+    }
+    $map = [
+        // ---------- 订单主体 ----------
+        'orders' => '订单',
+        'id' => 'ID',
+        'name' => '订单号',
+        'status' => '订单状态',
+        'financial_status' => '支付状态',
+        'fulfillment_status' => '发货状态',
+        'fulfillment_status_v2' => '发货状态(新)',
+        'order_at' => '下单时间',
+        'created_at' => '创建时间',
+        'updated_at' => '更新时间',
+        'processed_at' => '支付完成时间',
+        'cancelled_at' => '取消时间',
+        'cancel_reason' => '取消原因',
+        'currency' => '币种',
+        'presentment_currency' => '展示币种',
+        'subtotal_price' => '商品小计',
+        'current_subtotal_price' => '当前商品小计',
+        'total_line_items_price' => '商品原价合计',
+        'total_discounts' => '优惠合计',
+        'current_total_discounts' => '当前优惠合计',
+        'total_tax' => '税费合计',
+        'current_total_tax' => '当前税费合计',
+        'current_total_price' => '应付总额',
+        'total_outstanding' => '未付金额',
+        'total_weight' => '总重量',
+        'total_tip_received' => '小费合计',
+        'taxes_included' => '价格含税',
+        'tax_type' => '税类型',
+        'tax_number' => '税号',
+        'tax_description' => '税费说明',
+        'hidden_order' => '是否隐藏订单',
+        'tags' => '标签',
+        'phone' => '电话',
+        'email' => '邮箱',
+        'note' => '备注',
+        'buyer_note' => '买家留言',
+        'channel_handle' => '销售渠道',
+        'order_source' => '订单来源',
+        'source_name' => '来源名称',
+        'source_identifier' => '来源标识',
+        'source_url' => '来源地址',
+        'referring_site' => '来源站点',
+        'landing_site' => '落地页',
+        'order_status_url' => '订单状态页',
+        'store_id' => '店铺 ID',
+        'user_id' => '用户 ID',
+        'processed_user_id' => '处理人 ID',
+        'pos_location_id' => 'POS 地点 ID',
+        'draft_order_id' => '草稿单 ID',
+        'contract_seq' => '合同序号',
+        'checkout_id' => '结账 ID',
+        'checkout_token' => '结账令牌',
+        'checkout_language' => '结账语言',
+        'customer_locale' => '客户语言',
+        'cart_token' => '购物车令牌',
+        'browser_ip' => '浏览器 IP',
+        'po_number' => '采购单号',
+        'credit_limit' => '信用额度',
+        'service' => '服务',
+        'adjust_price' => '调价金额',
+        'deduct_member_point_amount' => '扣减积分金额',
+        'payment_gateway_names' => '支付渠道',
+        'payment_terms' => '账期条款',
+        'refunds' => '退款记录',
+        'note_attributes' => '备注属性',
+        'return_info' => '退货信息',
+        'client_details' => '客户端信息',
+        'customer' => '客户',
+        'line_items' => '商品明细',
+        'shipping_address' => '收货地址',
+        'billing_address' => '账单地址',
+        'shipping_lines' => '运费明细',
+        'fulfillments' => '发货单',
+        'locations' => '库存地点',
+        'payment_details' => '支付明细',
+        'tax_lines' => '税费明细',
+        'discount_codes' => '优惠码',
+        'discount_applications' => '优惠规则',
+        'utm_parameters' => 'UTM 参数',
+
+        // ---------- 客户 ----------
+        'customers' => '客户',
+        'customer' => '客户',
+        'first_name' => '名',
+        'last_name' => '姓',
+        'nick_name' => '昵称',
+        'area_code' => '电话区号',
+        'addresses' => '地址列表',
+        'default_address' => '默认地址',
+        'orders_count' => '订单数',
+        'total_spent' => '累计消费',
+        'last_order_id' => '最近订单 ID',
+        'last_order_name' => '最近订单号',
+        'verified_email' => '邮箱已验证',
+        'accepts_marketing' => '接受邮件营销',
+        'accepts_mobile_marketing' => '接受短信营销',
+        'email_subscribe_flag' => '邮件订阅标记',
+        'mobile_subscribe_flag' => '短信订阅标记',
+        'email_marketing_consent' => '邮件营销授权',
+        'sms_marketing_consent' => '短信营销授权',
+        'social_customer' => '社交账号',
+        'multipass_identifier' => 'Multipass 标识',
+        'gender' => '性别',
+        'birthday' => '生日',
+        'language' => '语言',
+        'state' => '状态',
+        'asid' => 'ASID',
+        'accepts_marketing_updated_at' => '邮件营销更新时间',
+        'accepts_mobile_marketing_updated_at' => '短信营销更新时间',
+
+        // ---------- 地址 ----------
+        'address1' => '地址1',
+        'address2' => '地址2',
+        'city' => '城市',
+        'province' => '省/州',
+        'province_code' => '省/州代码',
+        'province_code_v2' => '省/州代码(新)',
+        'standard_province_code' => '标准省/州代码',
+        'country' => '国家',
+        'country_code' => '国家代码',
+        'zip' => '邮编',
+        'company' => '公司',
+        'latitude' => '纬度',
+        'longitude' => '经度',
+        'district' => '区',
+        'district_code' => '区代码',
+        'neighborhood' => '街区',
+        'town' => '镇',
+        'address' => '地址',
+        'address_add' => '补充地址',
+        'return_status' => '退货状态',
+        'delivery_store_code' => '提货点代码',
+        'delivery_store_name' => '提货点名称',
+        'default' => '是否默认',
+        'customer_id' => '客户 ID',
+
+        // ---------- 商品 / 规格 ----------
+        'products' => '商品',
+        'product' => '商品',
+        'title' => '标题',
+        'variant_title' => '规格',
+        'sku' => 'SKU',
+        'price' => '单价',
+        'price_set' => '单价(含币种)',
+        'quantity' => '数量',
+        'fulfillable_quantity' => '可发货数量',
+        'fulfillment_quantity' => '已发货数量',
+        'fulfillment_service' => '发货服务',
+        'requires_shipping' => '需发货',
+        'taxable' => '需计税',
+        'product_id' => '商品 ID',
+        'variant_id' => '规格 ID',
+        'image_url' => '图片地址',
+        'vendor' => '供应商',
+        'grams' => '重量(克)',
+        'gift_card' => '礼品卡',
+        'properties' => '附加属性',
+        'customized_attributes' => '自定义属性',
+        'discount_allocations' => '优惠分摊',
+        'duties' => '关税',
+        'is_bundle' => '是否组合',
+        'is_bundle_component' => '是否组合子项',
+        'bundle_parent_item' => '组合父项',
+        'bundle_parent_variant_id' => '组合父规格 ID',
+        'attribute' => '属性',
+        'harmonized_system_code' => 'HS 编码',
+        'country_code_of_origin' => '原产国代码',
+        'location_id' => '地点 ID',
+        'handle' => 'URL 标识',
+        'body_html' => '详情 HTML',
+        'product_type' => '商品类型',
+        'product_category' => '商品分类',
+        'standard_category_id' => '标准分类 ID',
+        'published_at' => '发布时间',
+        'published_scope' => '发布范围',
+        'template_path' => '模板路径',
+        'total_inventory' => '总库存',
+        'variants' => '规格列表',
+        'options' => '选项',
+        'images' => '图片列表',
+        'image' => '图片',
+        'media' => '媒体',
+        'featured_media' => '特色媒体',
+        'is_gift_card' => '是否礼品卡',
+        'unlisted' => '是否隐藏',
+        'combined_listing' => '组合 listing',
+        'combined_listing_role' => '组合 listing 角色',
+        'product_behavior' => '商品行为',
+        'spu' => 'SPU',
+        'path' => '路径',
+        'subtitle' => '副标题',
+        'option1' => '选项1',
+        'option2' => '选项2',
+        'option3' => '选项3',
+        'option4' => '选项4',
+        'option5' => '选项5',
+        'position' => '排序',
+        'weight' => '重量',
+        'weight_unit' => '重量单位',
+        'inventory_item_id' => '库存单位 ID',
+        'inventory_quantity' => '库存数量',
+        'inventory_tracker' => '追踪库存',
+        'inventory_policy' => '缺货策略',
+        'compare_at_price' => '划线价',
+        'barcode' => '条码',
+        'require_shipping' => '需发货',
+        'src' => '图片地址',
+        'alt' => '图片描述',
+
+        // ---------- 库存 ----------
+        'inventory_levels' => '库存数量',
+        'inventory_items' => '库存单位',
+        'available' => '可用数量',
+        'tracked' => '是否追踪',
+        'cost' => '成本',
+        'required_shipping' => '需发货',
+
+        // ---------- 履约单 ----------
+        'fulfillment_orders' => '履约单',
+        'request_status' => '请求状态',
+        'assigned_location_id' => '分配地点 ID',
+        'assigned_location' => '分配地点',
+        'shop_id' => '店铺 ID',
+        'fulfill_at' => '发货时间',
+        'fulfill_by' => '最迟发货时间',
+        'supported_actions' => '支持的操作',
+        'fulfillment_holds' => '履约冻结',
+        'delivery_method' => '配送方式',
+        'merchant_requests' => '商家请求',
+        'destination' => '目的地',
+        'display_status' => '显示状态',
+
+        // ---------- 物流 / 支付 / 风控 / 通用 ----------
+        'tracking_company' => '物流公司',
+        'tracking_number' => '运单号',
+        'tracking_numbers' => '运单号列表',
+        'tracking_url' => '物流跟踪链接',
+        'tracking_urls' => '物流跟踪链接列表',
+        'tracking_info_list' => '物流信息',
+        'shipment_status' => '物流/签收状态',
+        'order_id' => '订单 ID',
+        'amount' => '金额',
+        'amount_set' => '金额(含币种)',
+        'currency_code' => '币种',
+        'shop_money' => '店铺币种金额',
+        'presentment_money' => '买家币种金额',
+        'message' => '消息',
+        'code' => '代码',
+        'type' => '类型',
+        'value' => '值',
+        'rate' => '税率',
+        'gateway' => '支付网关',
+        'receipt' => '凭证',
+        'error_code' => '错误码',
+        'error_msg' => '错误信息',
+        'status_msg' => '状态信息',
+        'status_code' => '状态码',
+        'kind' => '交易类型',
+        'credit_card_number' => '卡号',
+        'credit_card_bin' => '卡 BIN',
+        'credit_card_brand' => '卡品牌',
+        'credit_card_expire_month' => '卡有效期(月)',
+        'credit_card_expire_year' => '卡有效期(年)',
+        'score' => '风险评分',
+        'recommendation' => '风险建议',
+        'risk_detail_msg_list' => '风险明细',
+        'risk_detail_level' => '风险级别',
+        'risk_detail_msg' => '风险说明',
+        'cause_cancel' => '是否导致取消',
+        'source' => '来源',
+        'display' => '是否展示',
+        'order_risk_seq' => '风险序号',
+        'order_seq' => '订单序号',
+        'metafields' => '自定义字段',
+        'discounted_price' => '折后价',
+        'discounted_price_set' => '折后价(含币种)',
+        'shipping_price' => '运费',
+        'shipping_price_set' => '运费(含币种)',
+        'shipping_strategy_name' => '运费策略',
+        'requested_fulfillment_service_id' => '请求的履约服务 ID',
+        'total_shipping_price_set' => '运费合计(含币种)',
+        'settle_pay_amount' => '结算金额',
+        'create_time' => '创建时间',
+        'pay_channel' => '支付渠道',
+        'pay_merchant_order_id' => '商户订单号',
+        'pay_status' => '支付状态',
+        'payment_method' => '支付方式',
+        'settle_currency' => '结算币种',
+        'pay_channel_deal_id' => '渠道交易号',
+        'pay_amount' => '支付金额',
+        'pay_merchant_email' => '商户邮箱',
+        'pay_merchant_id' => '商户 ID',
+        'pay_seq' => '支付流水号',
+        'giftcard_presentment_money' => '礼品卡金额',
+        'refund_id' => '退款 ID',
+        'order_adjustments' => '订单调账',
+        'refund_line_items' => '退款商品明细',
+        'transactions_v2' => '交易记录(新)',
+        'total_duties_set' => '关税合计(含币种)',
+        'tax_amount_set' => '税费金额(含币种)',
+        'current_total_duties' => '当前关税合计',
+        'activity_type' => '活动类型',
+        'additional' => '附加说明',
+        'allocation_method' => '分摊方式',
+        'benefit_type' => '优惠类型',
+        'description' => '描述',
+        'discount_application_index' => '优惠索引',
+        'role_visibility' => '可见角色',
+        'session_hash' => '会话哈希',
+        'show' => '是否展示',
+        'target_selection' => '目标选择',
+        'target_type' => '目标类型',
+        'update_time' => '更新时间',
+        'urls' => '链接列表',
+        'user_agent' => '浏览器 UA',
+        'value_type' => '值类型',
+        'caption' => '说明文字',
+        'content_type' => '内容类型',
+        'preview_image' => '预览图',
+        'values_colors' => '颜色值',
+        'values_images' => '图片值',
+        'consent_collected_from' => '授权来源',
+        'consent_updated_at' => '授权更新时间',
+        'opt_in_level' => '订阅级别',
+        'fulfillment_order_id' => '履约单 ID',
+        'line_item_id' => '订单商品行 ID',
+    ];
+    return $map;
+}
+
+/** 取字段中文标签：支持按父级上下文消歧；xxx_set 自动复用基字段标签 */
+function fieldLabel(string $key, string $parent = ''): string
+{
+    static $ctx = [
+        'name' => [
+            'orders' => '订单号', 'line_items' => '商品名称', 'locations' => '地点名称',
+            'fulfillments' => '发货单名称', 'tax_lines' => '税费名称',
+            'shipping_lines' => '运费名称', 'properties' => '属性名称',
+            'customized_attributes' => '属性名称',
+        ],
+        'id' => [
+            'orders' => '订单 ID', 'line_items' => '明细 ID', 'fulfillments' => '发货单 ID',
+            'customers' => '客户 ID', 'customer' => '客户 ID',
+            'products' => '商品 ID', 'product' => '商品 ID', 'variants' => '规格 ID',
+            'transactions' => '交易 ID', 'refunds' => '退款 ID',
+            'locations' => '地点 ID', 'tax_lines' => '税费行 ID',
+            'discount_codes' => '优惠码 ID', 'shipping_lines' => '运费行 ID',
+            'payment_details' => '支付明细 ID', 'fulfillment_orders' => '履约单 ID',
+            'inventory_levels' => '库存记录 ID', 'inventory_items' => '库存单位 ID',
+            'addresses' => '地址 ID', 'default_address' => '地址 ID',
+        ],
+        'title' => [
+            'line_items' => '商品标题', 'tax_lines' => '税费标题',
+            'shipping_lines' => '运费标题', 'discount_applications' => '优惠标题',
+        ],
+    ];
+
+    if ($parent !== '' && isset($ctx[$key][$parent])) {
+        return $ctx[$key][$parent];
+    }
+
+    $map = fieldLabels();
+    if (isset($map[$key])) {
+        return $map[$key];
+    }
+    if (substr($key, -4) === '_set') {
+        $base = substr($key, 0, -4);
+        if (isset($map[$base])) {
+            return $map[$base] . '(含币种)';
+        }
+    }
+    return $key;
+}
+
+/** 枚举值翻译（按字段名区分；未命中返回 null，表示按原值展示） */
+function enumLabel(string $key, string $value): ?string
+{
+    static $enums = [
+        'status' => [
+            'open' => '处理中', 'cancelled' => '已取消', 'closed' => '已关闭', 'any' => '全部',
+        ],
+        'financial_status' => [
+            'unpaid' => '未支付', 'authorized' => '已授权', 'pending' => '支付中',
+            'partially_paid' => '部分支付', 'paid' => '已支付',
+            'partially_refunded' => '部分退款', 'refunded' => '已退款',
+        ],
+        'fulfillment_status' => [
+            'unshipped' => '未发货', 'partial' => '部分发货', 'shipped' => '已发货',
+            'unfulfilled' => '未发货', 'fulfilled' => '已履约',
+        ],
+        'fulfillment_status_v2' => [
+            'unfulfilled' => '未发货', 'partial' => '部分发货',
+            'fulfilled' => '已履约', 'shipped' => '已发货',
+        ],
+        'kind' => [
+            'sale' => '销售', 'refund' => '退款', 'authorization' => '授权',
+            'capture' => '扣款', 'void' => '作废',
+        ],
+        'recommendation' => [
+            'accept' => '接受', 'cancel' => '建议取消', 'investigate' => '需调查',
+        ],
+        'return_status' => [
+            'NO_RETURN' => '无退货', 'RETURNED' => '已退货',
+        ],
+        'shipment_status' => [
+            'out_for_delivery' => '正在配送', 'delivered' => '已送达',
+            'picked_up' => '已取货', 'faliure' => '配送失败',
+        ],
+        'gender' => ['male' => '男', 'female' => '女', 'unknown' => '未知'],
+        'pay_status' => [
+            'paid' => '已支付', 'unpaid' => '未支付', 'pending' => '支付中',
+            'refunded' => '已退款', 'failed' => '失败',
+        ],
+    ];
+    return $enums[$key][$value] ?? null;
+}
+
+/** 标量值 → 中文文本 */
+function scalarText(string $key, $value): string
+{
+    if ($value === null) {
+        return '空';
+    }
+    if (is_bool($value)) {
+        return $value ? '是' : '否';
+    }
+    if (is_string($value)) {
+        if ($value === '') {
+            return '空';
+        }
+        $enum = enumLabel($key, $value);
+        return $enum === null ? $value : "{$value}（{$enum}）";
+    }
+    return (string) $value;
+}
+
+/** 递归渲染为中文键值对文本（$parentKey 用于消歧字段标签） */
+function renderChinese($data, int $depth = 0, string $parentKey = ''): string
+{
+    $indent = str_repeat('  ', $depth);
+
+    if (!is_array($data)) {
+        return $indent . scalarText('', $data) . "\n";
+    }
+    if (empty($data)) {
+        return $indent . '（空）' . "\n";
+    }
+
+    $out = '';
+    if (array_is_list($data)) {
+        foreach ($data as $i => $item) {
+            if (is_array($item) && !empty($item)) {
+                $out .= $indent . '第 ' . ($i + 1) . ' 项：' . "\n";
+                $out .= renderChinese($item, $depth + 1, $parentKey);
+            } elseif (is_array($item)) {
+                $out .= $indent . '第 ' . ($i + 1) . ' 项：（空）' . "\n";
+            } else {
+                $out .= $indent . '- ' . scalarText('', $item) . "\n";
+            }
+        }
+        return $out;
+    }
+
+    foreach ($data as $key => $value) {
+        $key   = (string) $key;
+        $label = fieldLabel($key, $parentKey);
+
+        // xxx_set 金额对象压缩成一行，避免大量重复嵌套
+        if (substr($key, -4) === '_set' && is_array($value) && isset($value['shop_money'])) {
+            $shop    = $value['shop_money']['amount'] ?? '';
+            $shopCur = $value['shop_money']['currency_code'] ?? '';
+            $pres    = $value['presentment_money']['amount'] ?? null;
+            $presCur = $value['presentment_money']['currency_code'] ?? '';
+            $txt = trim($shopCur . ' ' . $shop);
+            if ($pres !== null && ($pres !== $shop || $presCur !== $shopCur)) {
+                $txt .= "（买家 {$presCur} {$pres}）";
+            }
+            $out .= $indent . $label . '：' . $txt . "\n";
+            continue;
+        }
+
+        if (is_array($value)) {
+            if (empty($value)) {
+                $out .= $indent . $label . '：（空）' . "\n";
+            } elseif (array_is_list($value)) {
+                $out .= $indent . $label . '（共 ' . count($value) . ' 项）：' . "\n";
+                $out .= renderChinese($value, $depth + 1, $key);
+            } else {
+                $out .= $indent . $label . '：' . "\n";
+                $out .= renderChinese($value, $depth + 1, $key);
+            }
+        } else {
+            $out .= $indent . $label . '：' . scalarText($key, $value) . "\n";
+        }
+    }
+    return $out;
+}
+
+// ============================================================
 // 工具返回结构（v2：text + data + isError）
 // ============================================================
 
 /**
- * 组装工具返回：content 文本（摘要 + JSON） + structuredContent（原始数据）
+ * 组装工具返回：
+ *   - text：中文键值对描述（便于大模型/人阅读）
+ *   - data：原始数据（structuredContent，供程序解析）
  *
- * structuredContent 不受 $MAX_OUTPUT_CHARS 限制，因此完整数据始终可被程序解析。
+ * text 受 $MAX_OUTPUT_CHARS 限制，data 不受限制。
  */
 function formatResult(string $summary, $data, string $link = ''): array
 {
+    return formatResultText($summary, renderChinese($data), $data, $link);
+}
+
+/** 用自定义正文组装返回（正文由调用方渲染，例如订单精简视图） */
+function formatResultText(string $summary, string $body, $data, string $link = ''): array
+{
     global $MAX_OUTPUT_CHARS;
 
-    $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
-    if ($json === false) {
-        $json = '(无法序列化返回数据)';
-    }
-
     $truncated = false;
-    if (mb_strlen($json) > $MAX_OUTPUT_CHARS) {
-        $json      = mb_substr($json, 0, $MAX_OUTPUT_CHARS);
+    if (mb_strlen($body) > $MAX_OUTPUT_CHARS) {
+        $body      = mb_substr($body, 0, $MAX_OUTPUT_CHARS);
         $truncated = true;
     }
 
@@ -507,9 +1092,9 @@ function formatResult(string $summary, $data, string $link = ''): array
     if ($pageInfo !== '') {
         $out .= "\n下一页游标 page_info：{$pageInfo}（把它作为 page_info 参数再次调用即可翻页）";
     }
-    $out .= "\n\n" . $json;
+    $out .= "\n\n" . $body;
     if ($truncated) {
-        $out .= "\n\n...（返回内容过长已截断，请用 limit / 时间范围 / 筛选条件缩小结果）";
+        $out .= "\n...（返回内容过长已截断，请用 limit / 时间范围 / 筛选条件缩小结果）";
     }
 
     // structuredContent：原始数据 + 分页游标（完整、不截断）
@@ -519,6 +1104,88 @@ function formatResult(string $summary, $data, string $link = ''): array
     }
 
     return ['text' => $out, 'data' => $sc, 'isError' => false];
+}
+
+// ============================================================
+// 订单精简视图（列表场景用，每笔约 10 行）
+// ============================================================
+
+/** 枚举值 → 「原值（中文）」；空值返回「空」 */
+function briefEnum(string $key, $value): string
+{
+    if ($value === null || $value === '') {
+        return '空';
+    }
+    $value = (string) $value;
+    $label = enumLabel($key, $value);
+    return $label === null ? $value : "{$value}（{$label}）";
+}
+
+/** 商品明细 → 「标题 × 数量；标题 × 数量」 */
+function briefItems(array $items): string
+{
+    if (empty($items)) {
+        return '空';
+    }
+    $parts = [];
+    foreach ($items as $it) {
+        $title = $it['title'] ?? ($it['name'] ?? '');
+        $qty   = $it['quantity'] ?? 1;
+        $parts[] = trim($title) === '' ? "× {$qty}" : "{$title} × {$qty}";
+    }
+    return implode('；', $parts);
+}
+
+/** 发货单 → 「物流公司 运单号（物流状态）；…」 */
+function briefTracking(array $fulfillments): string
+{
+    if (empty($fulfillments)) {
+        return '未发货';
+    }
+    $parts = [];
+    foreach ($fulfillments as $f) {
+        $txt = trim(((string) ($f['tracking_company'] ?? '')) . ' ' . ((string) ($f['tracking_number'] ?? '')));
+        if ($txt === '') {
+            $txt = '已发货';
+        }
+        $ship = $f['shipment_status'] ?? null;
+        if ($ship) {
+            $txt .= '（' . briefEnum('shipment_status', $ship) . '）';
+        }
+        $parts[] = $txt;
+    }
+    return implode('；', $parts);
+}
+
+/**
+ * 订单列表精简视图：每笔只输出售后判断所需的关键字段。
+ * 需要完整字段时用 get_order。
+ */
+function renderOrderBriefList(array $orders): string
+{
+    if (empty($orders)) {
+        return "  （无订单）\n";
+    }
+
+    $out = '订单列表（共 ' . count($orders) . ' 笔）：' . "\n";
+    foreach ($orders as $i => $o) {
+        $customer = trim(
+            ((string) ($o['customer']['first_name'] ?? '')) . ' ' .
+            ((string) ($o['customer']['last_name'] ?? ''))
+        );
+
+        $out .= '  第 ' . ($i + 1) . ' 笔：' . "\n";
+        $out .= '    订单号：' . (($o['name'] ?? '') !== '' ? $o['name'] : '空') . "\n";
+        $out .= '    下单时间：' . (($o['created_at'] ?? '') !== '' ? $o['created_at'] : '空') . "\n";
+        $out .= '    应付总额：' . trim(((string) ($o['current_total_price'] ?? '')) . ' ' . ((string) ($o['currency'] ?? ''))) . "\n";
+        $out .= '    支付状态：' . briefEnum('financial_status', $o['financial_status'] ?? null) . "\n";
+        $out .= '    发货状态：' . briefEnum('fulfillment_status_v2', $o['fulfillment_status_v2'] ?? ($o['fulfillment_status'] ?? null)) . "\n";
+        $out .= '    客户：' . ($customer !== '' ? $customer : '空') . "\n";
+        $out .= '    邮箱：' . (($o['email'] ?? '') !== '' ? $o['email'] : '空') . "\n";
+        $out .= '    商品：' . briefItems($o['line_items'] ?? []) . "\n";
+        $out .= '    物流：' . briefTracking($o['fulfillments'] ?? []) . "\n";
+    }
+    return $out;
 }
 
 /** API 调用失败的统一输出（isError = true） */
@@ -555,7 +1222,7 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'list_orders',
-            'description' => '查询 SHOPLINE 订单列表。支持按创建时间、更新时间、订单状态、支付状态、履约状态、订单号、邮箱等条件筛选。当用户询问"最近订单""某天的订单""未发货订单""某客户订单"时使用。注意：SHOPLINE 存在「隐藏订单」（hidden_order），默认不返回；本工具一律先查非隐藏订单，若结果为空再自动补查隐藏订单，避免漏单。',
+            'description' => '查询 SHOPLINE 订单列表（售后查客户订单首选）。支持按创建时间、更新时间、订单状态、支付状态、发货状态、订单号、邮箱等条件筛选。本工具会完整覆盖所有订单并合并去重（按创建时间倒序），不会漏单。返回精简视图（每笔约 10 行），需要完整字段请用 get_order。当用户询问"最近订单""某天的订单""未发货订单""某客户订单"时使用。',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
@@ -565,19 +1232,17 @@ function getToolDefinitions(): array
                     'updated_at_max'     => ['type' => 'string', 'description' => '更新时间上限，ISO 8601'],
                     'order_at_min'       => ['type' => 'string', 'description' => '下单时间下限，ISO 8601'],
                     'order_at_max'       => ['type' => 'string', 'description' => '下单时间上限，ISO 8601'],
-                    'status'             => ['type' => 'string', 'description' => '订单状态，如 open / closed / cancelled'],
-                    'financial_status'   => ['type' => 'string', 'description' => '支付状态，如 paid / pending / refunded / partially_refunded'],
-                    'fulfillment_status' => ['type' => 'string', 'description' => '履约状态，如 unfulfilled / partial / fulfilled'],
+                    'status'             => ['type' => 'string', 'description' => '订单状态，仅接受 open（处理中）/ cancelled（已取消）/ any（含已归档）。传其他值会报错。'],
+                    'financial_status'   => ['type' => 'string', 'description' => '支付状态：unpaid / authorized / pending / partially_paid / paid / partially_refunded / refunded'],
+                    'fulfillment_status' => ['type' => 'string', 'description' => '发货状态：unshipped（未发货）/ partial（部分发货）/ shipped（已发货）。注意不是 unfulfilled / fulfilled，传错会 500。'],
                     'ids'                => ['type' => 'string', 'description' => '订单 ID 列表，多个用英文逗号分隔'],
                     'name'               => ['type' => 'string', 'description' => '订单号，如 MG3812'],
                     'email'              => ['type' => 'string', 'description' => '买家邮箱'],
                     'buyer_id'           => ['type' => 'string', 'description' => '买家 ID'],
                     'location'           => ['type' => 'string', 'description' => '订单来源地区'],
                     'search_content'     => ['type' => 'string', 'description' => '关键字搜索（订单号、客户等）'],
-                    'sort_condition'     => ['type' => 'string', 'description' => '排序条件'],
                     'contract_ids'       => ['type' => 'string', 'description' => '合同/交易单 ID，多个用逗号分隔'],
-                    'hidden_order'       => ['type' => 'boolean', 'description' => '隐藏订单过滤开关。SHOPLINE 语义：true=只返回隐藏订单，false/不传=只返回非隐藏订单（无法一次同时返回两类）。一般无需传；本工具已内置「先查非隐藏单，查不到再补查隐藏单」的兜底。'],
-                    'limit'              => ['type' => 'integer', 'description' => '返回条数，默认 20，最大 100（orders 接口上限，超出会报错）', 'default' => 20],
+                    'limit'              => ['type' => 'integer', 'description' => '合并后返回条数，默认 20，最大 100', 'default' => 20],
                     'since_id'           => ['type' => 'string', 'description' => '只返回 ID 大于该值的记录（增量拉取）'],
                     'page_info'          => ['type' => 'string', 'description' => '分页游标，上一页返回的 page_info'],
                 ],
@@ -586,14 +1251,14 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'get_order',
-            'description' => '根据订单 ID 或订单号查询订单完整详情（含商品明细、金额、收货地址、支付与履约信息）。order_id 传纯数字视为订单 ID，传含字母的订单号（如 MG3812）会自动识别。若该订单为隐藏订单，会自动补查。',
+            'description' => '查询订单详情。支持两种入参，order_id 与 email 至少传一个：① order_id（订单号如 MG3812，或纯数字订单 ID）→ 返回该单完整详情；② email → 返回该邮箱下**所有订单的完整详情**（可能多笔，文本较长）。两者同时传时优先用 order_id，查不到再回落到 email。所有订单都会被覆盖，不会漏单。',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
-                    'order_id'     => ['type' => 'string', 'description' => '订单 ID 或订单号（必填）。纯数字（如 21071356717618744607449368）按订单 ID 查；含字母（如 MG3812）按订单号查，工具会自动识别。'],
-                    'hidden_order' => ['type' => 'boolean', 'description' => '隐藏订单过滤开关（true=只查隐藏订单）。一般无需传，工具已内置自动补查。'],
+                    'order_id' => ['type' => 'string', 'description' => '订单号或订单 ID（可选）。纯数字（如 21071356717618744607449368）按订单 ID 查；含字母（如 MG3812）按订单号查。与 email 至少传一个。'],
+                    'email'    => ['type' => 'string', 'description' => '买家邮箱（可选）。order_id 未传或查不到时使用；命中多笔时返回精简列表。与 order_id 至少传一个。'],
                 ],
-                'required' => ['order_id'],
+                'required' => [],
             ],
         ],
         [
@@ -693,13 +1358,12 @@ function getToolDefinitions(): array
         ],
         [
             'name' => 'list_fulfillment_orders',
-            'description' => '查询履约单（发货单）列表。location_ids 为必填。当用户询问"待发货订单""某地点的待处理履约单""履约进度"时使用。',
+            'description' => '查询履约单（发货单）列表。location_ids 为必填。当用户询问"某地点的待处理履约单""履约进度"时使用。注意：SHOPLINE 该接口不支持按订单过滤（order_id 参数会被忽略），查某笔订单的发货信息请直接用 get_order —— 订单对象已内嵌 fulfillments。',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
                     'location_ids'      => ['type' => 'string', 'description' => '地点 ID，必填，多个用英文逗号分隔'],
                     'assignment_status' => ['type' => 'string', 'description' => '分配状态，如 awaiting / assigned / cancelled'],
-                    'order_id'          => ['type' => 'string', 'description' => '按订单 ID 筛选'],
                     'limit'             => ['type' => 'integer', 'description' => '返回条数，默认 20', 'default' => 20],
                     'since_id'          => ['type' => 'string', 'description' => '只返回 ID 大于该值的记录'],
                     'page_info'         => ['type' => 'string', 'description' => '分页游标'],
@@ -769,55 +1433,116 @@ function toolListOrders(array $args): array
 {
     $allowed = ['created_at_min', 'created_at_max', 'updated_at_min', 'updated_at_max',
         'order_at_min', 'order_at_max', 'status', 'financial_status', 'fulfillment_status',
-        'ids', 'name', 'email', 'buyer_id', 'location', 'search_content', 'sort_condition',
-        'contract_ids', 'hidden_order', 'limit', 'since_id', 'page_info'];
+        'ids', 'name', 'email', 'buyer_id', 'location', 'search_content',
+        'contract_ids', 'limit', 'since_id', 'page_info'];
     $q = cleanQuery($args, $allowed);
+
+    // 枚举强校验：SHOPLINE 对这几个字段做严格校验，传错值会直接 500。
+    // 这里提前拦截，给出可读提示（比 500 友好得多）。
+    $enumChecks = [
+        'status'             => ['open', 'cancelled', 'any'],
+        'financial_status'   => ['unpaid', 'authorized', 'pending', 'partially_paid', 'paid', 'partially_refunded', 'refunded'],
+        'fulfillment_status' => ['unshipped', 'partial', 'shipped'],
+    ];
+    foreach ($enumChecks as $field => $allowedValues) {
+        if (isset($q[$field]) && !in_array((string) $q[$field], $allowedValues, true)) {
+            return toolError("错误：{$field} 只能是 " . implode(' / ', $allowedValues) . "（收到：{$q[$field]}）");
+        }
+    }
+
     // orders.json 的 limit 上限为 100（传 >100 会 500），此处按 100 截断
     $q['limit'] = min((int) ($q['limit'] ?? 20), 100);
 
-    // 一律先查非隐藏单；若未显式指定 hidden_order 且查不到，再自动补查隐藏单
-    $autoRetry = !isset($q['hidden_order']);
-    $r = ordersRequestWithHiddenFallback($q, $autoRetry);
+    // 隐藏单 + 非隐藏单「分别查询并合并」，避免漏单
+    $r = ordersRequestBoth($q);
     if (!$r['ok']) {
         return failText($r);
     }
-    $n = countList($r['data'], ['orders', 'items', 'data']);
-    return formatResult("查询到 {$n} 笔订单（limit={$q['limit']}）。", $r['data'], $r['link']);
+
+    $orders = $r['data']['orders'] ?? [];
+    $n      = count($orders);
+
+    if ($n === 0) {
+        return formatResult('没有找到符合条件的订单。', $r['data'], $r['link']);
+    }
+
+    $summary = "查询到 {$n} 笔订单（limit={$q['limit']}）";
+    if (!empty($r['truncated'])) {
+        $summary .= "；结果已按 limit 截断，如需更早的订单请用时间范围收窄";
+    }
+    $summary .= '：';
+
+    return formatResultText($summary, renderOrderBriefList($orders), $r['data'], $r['link']);
 }
 
 function toolGetOrder(array $args): array
 {
-    $id = trim((string) ($args['order_id'] ?? ''));
-    if ($id === '') {
-        return toolError('错误：缺少 order_id 参数');
-    }
-    $q = cleanQuery($args, ['hidden_order']);
+    $id    = trim((string) ($args['order_id'] ?? ''));
+    $email = trim((string) ($args['email'] ?? ''));
 
-    // 自动识别参数类型：纯数字 → 订单 ID（用 ids）；含字母等 → 订单号（用 name）
-    if (preg_match('/^\d+$/', $id)) {
-        $q['ids'] = $id;
-        $label    = "订单 ID {$id}";
-    } else {
-        $q['name'] = $id;
-        $label     = "订单号 {$id}";
+    if ($id === '' && $email === '') {
+        return toolError('错误：请至少提供 order_id（订单号 / 订单 ID）或 email 之一');
+    }
+    if ($id !== '' && strpos($id, '@') !== false) {
+        return toolError("错误：order_id 不接受邮箱，请改用 email 参数（收到：{$id}）");
     }
 
-    // 先查非隐藏单，查不到再自动补查隐藏单
-    $autoRetry = !isset($q['hidden_order']);
-    $r = ordersRequestWithHiddenFallback($q, $autoRetry);
-    if (!$r['ok']) {
-        return failText($r);
+    $prefix = '';
+
+    // ① 优先按订单号 / 订单 ID（短路：非隐藏 → 隐藏）
+    if ($id !== '') {
+        if (preg_match('/^\d+$/', $id)) {
+            $q     = ['ids' => $id];
+            $label = "订单 ID {$id}";
+        } else {
+            $q     = ['name' => $id];
+            $label = "订单号 {$id}";
+        }
+
+        $r = ordersRequestSingle($q);
+        if (!$r['ok']) {
+            return failText($r);
+        }
+        if (countList($r['data'], ['orders', 'items', 'data']) > 0) {
+            return formatResult("{$label} 详情：", $r['data']);
+        }
+
+        if ($email === '') {
+            return [
+                'text'    => "未找到{$label} 对应的订单",
+                'data'    => is_array($r['data']) ? $r['data'] : ['orders' => []],
+                'isError' => false,
+            ];
+        }
+        $prefix = "未找到{$label}；";
     }
-    $n = countList($r['data'], ['orders', 'items', 'data']);
+
+    // ② 邮箱查询（隐藏单 + 非隐藏单合并）
+    $r2 = ordersRequestBoth(['email' => $email, 'limit' => 20]);
+    if (!$r2['ok']) {
+        return failText($r2);
+    }
+
+    $orders = $r2['data']['orders'] ?? [];
+    $n      = count($orders);
+
     if ($n === 0) {
-        // 空结果不是错误：isError 保持 false，structuredContent 为 {"orders":[]}
         return [
-            'text'    => "未找到{$label} 对应的订单",
-            'data'    => is_array($r['data']) ? $r['data'] : ['orders' => []],
+            'text'    => $prefix . "邮箱 {$email} 下也没有订单",
+            'data'    => is_array($r2['data']) ? $r2['data'] : ['orders' => []],
             'isError' => false,
         ];
     }
-    return formatResult("{$label} 详情：", $r['data']);
+
+    if ($n === 1) {
+        return formatResult($prefix . "按邮箱 {$email} 找到 1 笔订单：", $r2['data']);
+    }
+
+    // 多笔：每笔都输出完整详情（注意：文本会较长，超出上限会截断）
+    return formatResult(
+        $prefix . "邮箱 {$email} 下共 {$n} 笔订单（完整详情）：",
+        $r2['data']
+    );
 }
 
 function toolListProducts(array $args): array
@@ -919,7 +1644,7 @@ function toolListInventoryItems(array $args): array
 
 function toolListFulfillmentOrders(array $args): array
 {
-    $q = cleanQuery($args, ['location_ids', 'assignment_status', 'order_id', 'limit', 'since_id', 'page_info']);
+    $q = cleanQuery($args, ['location_ids', 'assignment_status', 'limit', 'since_id', 'page_info']);
     if (empty($q['location_ids'])) {
         return toolError('错误：location_ids 为必填（SHOPLINE 要求必须指定地点 ID，可从订单数据的 locations 字段获取）');
     }

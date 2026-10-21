@@ -237,12 +237,15 @@ const MCP_SUPPORTED_VERSIONS = ['2025-11-25'];
 
 const SERVER_NAME    = 'AWSC_Call_MCP';
 const SERVER_TITLE   = 'AWSC 通话记录（只读）';
-const SERVER_VERSION = '2.2.0';
+const SERVER_VERSION = '2.3.0';
 
 const JSON_SCHEMA_DIALECT = 'https://json-schema.org/draft/2020-12/schema';
 
 const SERVER_INSTRUCTIONS = 'AWSC 通话记录只读服务：通话列表、单条详情、转录文本、转录失败排查、通话统计。'
     . '时间字段为数据库时间；duration 单位为秒，duration_minutes 单位为分钟。';
+
+// content 文本最大字符数（超出会截断；structuredContent 不受限制）
+const MAX_TEXT_CHARS = 50000;
 
 // JSON-RPC 错误码
 const ERR_PARSE            = -32700;
@@ -437,6 +440,188 @@ function toolError(string $message): array
 }
 
 // ============================================================
+// 中文键值对渲染（content.text 用；structuredContent 仍保留原始数据）
+// ============================================================
+
+/** 英文字段名 → 中文标签（未收录的回退为原字段名） */
+function fieldLabels(): array
+{
+    static $map = null;
+    if ($map !== null) {
+        return $map;
+    }
+    $map = [
+        // 集合
+        'calls' => '通话记录',
+        'call' => '通话详情',
+        'failures' => '转录失败记录',
+        'stats' => '统计数据',
+        'count' => '条数',
+        'hours_back' => '回溯小时数',
+        'group_by' => '统计维度',
+        'group_key' => '分组',
+        'available' => '是否有转录',
+        'text' => '文本',
+
+        // 通话字段
+        'contact_id' => '通话 ID',
+        'project_id' => '项目 ID',
+        'agent_name' => '坐席',
+        'customerPhone' => '客户电话',
+        'systemPhone' => '系统电话',
+        'initiationTimestamp' => '呼入时间',
+        'disconnectTimestamp' => '挂断时间',
+        'duration' => '通话秒数',
+        'duration_minutes' => '通话分钟',
+        'queuedDuration' => '排队秒数',
+        'queueName' => '队列',
+        'mediaStatus' => '录音状态',
+        'transcriptStatus' => '转录状态',
+        'media_status' => '录音状态',
+        'transcript_status' => '转录状态',
+        'recordingUrl' => '录音地址',
+        'recordingText' => '转录文本',
+        'is_voicemail' => '是否留言',
+        'conversation_turns' => '对话轮次',
+        'state' => '州',
+        'timezone' => '时区',
+        'project_date' => '项目日期',
+        'create_time' => '入库时间',
+        'aws_instance' => 'AWS 实例',
+        'id' => '记录 ID',
+        'channel' => '渠道',
+        'userName' => '坐席账号',
+
+        // 统计字段
+        'call_count' => '通话数',
+        'total_duration' => '总时长(秒)',
+        'avg_duration' => '平均时长(秒)',
+        'total_minutes' => '总时长(分钟)',
+        'avg_minutes' => '平均时长(分钟)',
+        'recording_count' => '有录音数',
+        'voicemail_count' => '留言数',
+    ];
+    return $map;
+}
+
+/** 取字段中文标签（未收录的回退为原字段名） */
+function fieldLabel(string $key): string
+{
+    $map = fieldLabels();
+    return $map[$key] ?? $key;
+}
+
+/** 枚举值翻译（按字段名区分；未命中返回 null，表示按原值展示） */
+function enumLabel(string $key, string $value): ?string
+{
+    static $enums = [
+        'mediaStatus' => ['AVAILABLE' => '有录音', 'no media' => '无录音'],
+        'media_status' => ['AVAILABLE' => '有录音', 'no media' => '无录音'],
+        'transcriptStatus' => [
+            'COMPLETED' => '已完成', 'FAILED' => '失败',
+            'ResourceNotFoundException' => '资源不存在',
+            'no text' => '无文本',
+        ],
+        'transcript_status' => [
+            'COMPLETED' => '已完成', 'FAILED' => '失败',
+            'ResourceNotFoundException' => '资源不存在',
+            'no text' => '无文本',
+        ],
+        'group_by' => ['project' => '项目', 'agent' => '坐席', 'date' => '日期'],
+    ];
+    return $enums[$key][$value] ?? null;
+}
+
+/** 标量值 → 中文文本 */
+function scalarText(string $key, $value): string
+{
+    if ($value === null) {
+        return '空';
+    }
+    // 数据库里 is_voicemail 是 0/1
+    if ($key === 'is_voicemail') {
+        return ($value === 1 || $value === '1' || $value === true) ? '是' : '否';
+    }
+    if (is_bool($value)) {
+        return $value ? '是' : '否';
+    }
+    if (is_string($value)) {
+        if ($value === '') {
+            return '空';
+        }
+        $enum = enumLabel($key, $value);
+        return $enum === null ? $value : "{$value}（{$enum}）";
+    }
+    return (string) $value;
+}
+
+/** 递归渲染为中文键值对文本 */
+function renderChinese($data, int $depth = 0): string
+{
+    $indent = str_repeat('  ', $depth);
+
+    if (!is_array($data)) {
+        return $indent . scalarText('', $data) . "\n";
+    }
+    if (empty($data)) {
+        return $indent . '（空）' . "\n";
+    }
+
+    $out = '';
+    if (array_is_list($data)) {
+        foreach ($data as $i => $item) {
+            if (is_array($item) && !empty($item)) {
+                $out .= $indent . '第 ' . ($i + 1) . ' 项：' . "\n";
+                $out .= renderChinese($item, $depth + 1);
+            } elseif (is_array($item)) {
+                $out .= $indent . '第 ' . ($i + 1) . ' 项：（空）' . "\n";
+            } else {
+                $out .= $indent . '- ' . scalarText('', $item) . "\n";
+            }
+        }
+        return $out;
+    }
+
+    foreach ($data as $key => $value) {
+        $key   = (string) $key;
+        $label = fieldLabel($key);
+        if (is_array($value)) {
+            if (empty($value)) {
+                $out .= $indent . $label . '：（空）' . "\n";
+            } elseif (array_is_list($value)) {
+                $out .= $indent . $label . '（共 ' . count($value) . ' 项）：' . "\n";
+                $out .= renderChinese($value, $depth + 1);
+            } else {
+                $out .= $indent . $label . '：' . "\n";
+                $out .= renderChinese($value, $depth + 1);
+            }
+        } else {
+            $out .= $indent . $label . '：' . scalarText($key, $value) . "\n";
+        }
+    }
+    return $out;
+}
+
+/** 组装工具返回：text（中文键值对） + data（原始数据） */
+function formatResult(string $summary, $data): array
+{
+    $body = renderChinese($data);
+
+    $truncated = false;
+    if (mb_strlen($body) > MAX_TEXT_CHARS) {
+        $body      = mb_substr($body, 0, MAX_TEXT_CHARS);
+        $truncated = true;
+    }
+
+    $out = $summary . "\n\n" . $body;
+    if ($truncated) {
+        $out .= "\n...（返回内容过长已截断，请用 limit 缩小结果）";
+    }
+
+    return ['text' => $out, 'data' => $data, 'isError' => false];
+}
+
+// ============================================================
 // 工具定义
 // ============================================================
 function getToolDefinitions(): array
@@ -571,35 +756,13 @@ function toolQueryCalls(array $args): array
         ->toArray();
 
     if (empty($rows)) {
-        return [
-            'text'    => '没有找到符合条件的通话记录',
-            'data'    => ['calls' => [], 'count' => 0],
-            'isError' => false,
-        ];
+        return formatResult('没有找到符合条件的通话记录', ['count' => 0, 'calls' => []]);
     }
 
-    $lines = ["找到 " . count($rows) . " 条通话记录："];
-    foreach ($rows as $r) {
-        $recording = $r['mediaStatus'] === 'AVAILABLE' ? '有录音' : '无录音';
-        $transcript = $r['transcriptStatus'] === 'COMPLETED' ? '已转录' : $r['transcriptStatus'];
-        $lines[] = sprintf(
-            "  [%s] %s | 坐席:%s | 客户:%s | 时长:%s分钟 | %s | %s | 挂断:%s",
-            $r['contact_id'],
-            $r['project_id'] ?: '未知项目',
-            $r['agent_name'] ?: '未知',
-            $r['customerPhone'],
-            $r['duration_minutes'],
-            $recording,
-            $transcript,
-            $r['disconnectTimestamp']
-        );
-    }
-
-    return [
-        'text'    => implode("\n", $lines),
-        'data'    => ['calls' => $rows, 'count' => count($rows)],
-        'isError' => false,
-    ];
+    return formatResult(
+        '找到 ' . count($rows) . ' 条通话记录',
+        ['count' => count($rows), 'calls' => $rows]
+    );
 }
 
 function toolGetCallDetail(array $args): array
@@ -614,52 +777,10 @@ function toolGetCallDetail(array $args): array
         ->find();
 
     if (!$row) {
-        return [
-            'text'    => "未找到 contact_id 为 {$contactId} 的通话记录",
-            'data'    => ['call' => null],
-            'isError' => false,
-        ];
+        return formatResult("未找到 contact_id 为 {$contactId} 的通话记录", ['call' => null]);
     }
 
-    $fields = [
-        'contact_id' => '通话ID',
-        'project_id' => '项目ID',
-        'agent_name' => '坐席',
-        'customerPhone' => '客户电话',
-        'systemPhone' => '系统电话',
-        'initiationTimestamp' => '呼入时间',
-        'disconnectTimestamp' => '挂断时间',
-        'duration' => '通话秒数',
-        'duration_minutes' => '通话分钟',
-        'queuedDuration' => '排队秒数',
-        'queueName' => '队列',
-        'mediaStatus' => '录音状态',
-        'transcriptStatus' => '转录状态',
-        'recordingUrl' => '录音地址',
-        'is_voicemail' => '是否留言',
-        'conversation_turns' => '对话轮次',
-        'state' => '州',
-        'timezone' => '时区',
-        'project_date' => '项目日期',
-        'create_time' => '入库时间',
-    ];
-
-    $lines = ["通话详情 [{$contactId}]："];
-    foreach ($fields as $field => $label) {
-        if (isset($row[$field]) && $row[$field] !== '' && $row[$field] !== null) {
-            $value = $row[$field];
-            if ($field === 'is_voicemail') {
-                $value = $value ? '是' : '否';
-            }
-            $lines[] = "  {$label}：{$value}";
-        }
-    }
-
-    return [
-        'text'    => implode("\n", $lines),
-        'data'    => ['call' => $row],
-        'isError' => false,
-    ];
+    return formatResult("通话详情 [{$contactId}]", ['call' => $row]);
 }
 
 function toolGetCallTranscript(array $args): array
@@ -675,11 +796,7 @@ function toolGetCallTranscript(array $args): array
         ->find();
 
     if (!$row) {
-        return [
-            'text'    => "未找到 contact_id 为 {$contactId} 的通话记录",
-            'data'    => ['call' => null],
-            'isError' => false,
-        ];
+        return formatResult("未找到 contact_id 为 {$contactId} 的通话记录", ['call' => null]);
     }
 
     $base = [
@@ -691,36 +808,30 @@ function toolGetCallTranscript(array $args): array
     ];
 
     if ($row['mediaStatus'] !== 'AVAILABLE') {
-        return [
-            'text'    => "该通话没有录音，无法提供转录文本（mediaStatus: {$row['mediaStatus']}）",
-            'data'    => $base + ['available' => false, 'text' => null],
-            'isError' => false,
-        ];
+        return formatResult(
+            "该通话没有录音，无法提供转录文本（mediaStatus: {$row['mediaStatus']}）",
+            $base + ['available' => false, 'text' => null]
+        );
     }
 
     if ($row['transcriptStatus'] !== 'COMPLETED') {
-        return [
-            'text'    => "转录尚未完成，当前状态：{$row['transcriptStatus']}",
-            'data'    => $base + ['available' => false, 'text' => null],
-            'isError' => false,
-        ];
+        return formatResult(
+            "转录尚未完成，当前状态：{$row['transcriptStatus']}",
+            $base + ['available' => false, 'text' => null]
+        );
     }
 
     if (empty($row['recordingText'])) {
-        return [
-            'text'    => "转录状态为 COMPLETED，但文本为空",
-            'data'    => $base + ['available' => true, 'text' => ''],
-            'isError' => false,
-        ];
+        return formatResult(
+            '转录状态为 COMPLETED，但文本为空',
+            $base + ['available' => true, 'text' => '']
+        );
     }
 
-    $header = "通话 {$contactId} 转录文本（对话轮次：{$row['conversation_turns']}，是否留言：" . ($row['is_voicemail'] ? '是' : '否') . "）：";
-
-    return [
-        'text'    => $header . "\n" . $row['recordingText'],
-        'data'    => $base + ['available' => true, 'text' => $row['recordingText']],
-        'isError' => false,
-    ];
+    return formatResult(
+        "通话 {$contactId} 转录文本",
+        $base + ['available' => true, 'text' => $row['recordingText']]
+    );
 }
 
 function toolListTranscriptFailures(array $args): array
@@ -744,31 +855,16 @@ function toolListTranscriptFailures(array $args): array
         ->toArray();
 
     if (empty($rows)) {
-        return [
-            'text'    => "最近 {$hoursBack} 小时内没有转录失败的记录",
-            'data'    => ['hours_back' => $hoursBack, 'failures' => [], 'count' => 0],
-            'isError' => false,
-        ];
-    }
-
-    $lines = ["最近 {$hoursBack} 小时内转录失败的记录（共 " . count($rows) . " 条）："];
-    foreach ($rows as $r) {
-        $lines[] = sprintf(
-            "  [%s] 实例:%s | 项目:%s | 坐席:%s | 挂断:%s | 状态:%s",
-            $r['contact_id'],
-            parse_url($r['aws_instance'], PHP_URL_HOST) ?: $r['aws_instance'],
-            $r['project_id'] ?: '未知',
-            $r['agent_name'] ?: '未知',
-            $r['disconnectTimestamp'],
-            $r['transcriptStatus'] ?: '空'
+        return formatResult(
+            "最近 {$hoursBack} 小时内没有转录失败的记录",
+            ['hours_back' => $hoursBack, 'count' => 0, 'failures' => []]
         );
     }
 
-    return [
-        'text'    => implode("\n", $lines),
-        'data'    => ['hours_back' => $hoursBack, 'failures' => $rows, 'count' => count($rows)],
-        'isError' => false,
-    ];
+    return formatResult(
+        "最近 {$hoursBack} 小时内转录失败的记录（共 " . count($rows) . " 条）",
+        ['hours_back' => $hoursBack, 'count' => count($rows), 'failures' => $rows]
+    );
 }
 
 function toolGetCallStats(array $args): array
@@ -805,32 +901,24 @@ function toolGetCallStats(array $args): array
         ->toArray();
 
     if (empty($rows)) {
-        return [
-            'text'    => '没有找到符合条件的统计数据',
-            'data'    => ['group_by' => $groupBy, 'stats' => [], 'count' => 0],
-            'isError' => false,
-        ];
-    }
-
-    $label = ['project' => '项目', 'agent' => '坐席', 'date' => '日期'][$groupBy] ?? '分组';
-    $lines = ["通话统计（按{$label}）："];
-    foreach ($rows as $r) {
-        $totalMin = round($r['total_duration'] / 60, 1);
-        $avgMin = round($r['avg_duration'] / 60, 1);
-        $lines[] = sprintf(
-            "  %s：%d 通 | 总时长 %s 分钟 | 平均 %s 分钟 | 有录音 %d 通 | 留言 %d 通",
-            $r['group_key'] ?: '未知',
-            $r['call_count'],
-            $totalMin,
-            $avgMin,
-            $r['recording_count'],
-            $r['voicemail_count']
+        return formatResult(
+            '没有找到符合条件的统计数据',
+            ['group_by' => $groupBy, 'count' => 0, 'stats' => []]
         );
     }
 
-    return [
-        'text'    => implode("\n", $lines),
-        'data'    => ['group_by' => $groupBy, 'stats' => $rows, 'count' => count($rows)],
-        'isError' => false,
-    ];
+    // 补上"分钟"口径，并收敛平均时长的精度，便于阅读
+    foreach ($rows as &$r) {
+        $r['total_minutes'] = round(((float) $r['total_duration']) / 60, 1);
+        $r['avg_minutes']   = round(((float) $r['avg_duration']) / 60, 1);
+        $r['avg_duration']  = round((float) $r['avg_duration'], 2);
+    }
+    unset($r);
+
+    $label = ['project' => '项目', 'agent' => '坐席', 'date' => '日期'][$groupBy] ?? '分组';
+
+    return formatResult(
+        "通话统计（按{$label}）",
+        ['group_by' => $groupBy, 'count' => count($rows), 'stats' => $rows]
+    );
 }
