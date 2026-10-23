@@ -114,7 +114,7 @@ const MCP_PROTOCOL_VERSION   = '2026-07-28';
 const MCP_SUPPORTED_VERSIONS = ['2026-07-28'];
 
 const SERVER_NAME    = 'SHOPLINE_Admin_MCP';
-const SERVER_VERSION = '2.2.2';
+const SERVER_VERSION = '2.2.3';
 
 // _meta 键名
 const META_VERSION     = 'io.modelcontextprotocol/protocolVersion';
@@ -1256,7 +1256,7 @@ function getToolDefinitions(): array
                 'type' => 'object',
                 'properties' => [
                     'order_id' => ['type' => 'string', 'description' => '订单号或订单 ID（可选）。纯数字（如 21071356717618744607449368）按订单 ID 查；含字母（如 MG3812）按订单号查。与 email 至少传一个。'],
-                    'email'    => ['type' => 'string', 'description' => '买家邮箱（可选）。order_id 未传或查不到时使用；命中多笔时返回精简列表。与 order_id 至少传一个。'],
+                    'email'    => ['type' => 'string', 'description' => '买家邮箱（可选）。order_id 未传或查不到时使用；命中多笔时返回每笔的完整详情（文本较长，订单过多会被截断）。与 order_id 至少传一个。'],
                 ],
                 'required' => [],
             ],
