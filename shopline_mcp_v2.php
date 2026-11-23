@@ -25,8 +25,8 @@
  *   10. 服务端可在每个 result 的 _meta 里自报身份（io.modelcontextprotocol/serverInfo）。
  *
  * 【本服务的工具】
- *   业务工具与 v1 完全一致（12 个只读工具），区别只在协议外壳：
- *     shopline_ping / list_orders / get_order / list_products / get_product /
+ *   业务工具为 13 个只读工具（含新增的 get_order_risks），区别只在协议外壳：
+ *     shopline_ping / list_orders / get_order / get_order_risks / list_products / get_product /
  *     list_customers / get_customer / list_locations / get_inventory_levels /
  *     list_inventory_items / list_fulfillment_orders / shopline_api_request
  *
@@ -1257,6 +1257,19 @@ function getToolDefinitions(): array
                 'properties' => [
                     'order_id' => ['type' => 'string', 'description' => '订单号或订单 ID（可选）。纯数字（如 21071356717618744607449368）按订单 ID 查；含字母（如 MG3812）按订单号查。与 email 至少传一个。'],
                     'email'    => ['type' => 'string', 'description' => '买家邮箱（可选）。order_id 未传或查不到时使用；命中多笔时返回每笔的完整详情（文本较长，订单过多会被截断）。与 order_id 至少传一个。'],
+                    'include_risks' => ['type' => 'boolean', 'description' => '是否一并查询每笔订单的欺诈风险并追加到 orders[i].risks（默认 true）。按邮箱命中多笔订单时会产生多次风控接口调用，不需要风控信息时可传 false 关闭。', 'default' => true],
+                ],
+                'required' => [],
+            ],
+        ],
+        [
+            'name' => 'get_order_risks',
+            'description' => '查询某笔订单的欺诈风险（SHOPLINE 风控结果）。传入订单号（如 MG3812）或内部订单 ID，工具会先解析出内部数字 ID 再查询（自动兼容隐藏订单）。返回风险列表：recommendation（accept 低风险 / investigate 中风险 / cancel 高风险）、score 风险分、cause_cancel 是否建议取消、source 来源，以及每条风险明细 message / risk_detail_level。当用户询问"这笔订单有没有欺诈风险""风控结果""风险评分""Fraud analysis"时使用。需要 read_orders 权限。',
+            'inputSchema' => [
+                'type' => 'object',
+                'properties' => [
+                    'order_id' => ['type' => 'string', 'description' => '订单号（如 MG3812）或内部数字订单 ID。与 email 至少传一个。'],
+                    'email'    => ['type' => 'string', 'description' => '买家邮箱（可选）。已提供 order_id 时忽略；仅传邮箱时取该邮箱下第一笔订单查询风险。'],
                 ],
                 'required' => [],
             ],
@@ -1397,6 +1410,7 @@ function executeTool(string $name, array $args): array
         'shopline_ping'           => toolPing(),
         'list_orders'             => toolListOrders($args),
         'get_order'               => toolGetOrder($args),
+        'get_order_risks'         => toolGetOrderRisks($args),
         'list_products'           => toolListProducts($args),
         'get_product'             => toolGetProduct($args),
         'list_customers'          => toolListCustomers($args),
@@ -1475,10 +1489,53 @@ function toolListOrders(array $args): array
     return formatResultText($summary, renderOrderBriefList($orders), $r['data'], $r['link']);
 }
 
+/**
+ * 给 get_order 返回的每笔订单追加 risks 字段（欺诈风险），内容来自风控接口 orders/v2/{数字ID}/risks.json。
+ *
+ * 设计要点：
+ *   · 只在每笔 order 上【追加】risks 键，绝不改动任何现有字段 —— n8n 读 structuredContent.orders[0].* 是硬契约。
+ *   · best-effort：单笔风控查询失败（权限不足 / 接口报错）时该笔 risks=[]，不影响订单本身返回。
+ *   · 仅用订单里的数字 id 请求，天然兼容隐藏单（隐藏单同样有内部 id）。
+ */
+function attachOrderRisks(array $data): array
+{
+    if (!isset($data['orders']) || !is_array($data['orders'])) {
+        return $data;
+    }
+    foreach ($data['orders'] as &$order) {
+        $order['risks'] = []; // 默认空，保证字段一定存在
+        $oid = (string) ($order['id'] ?? '');
+        if ($oid === '' || !preg_match('/^\d+$/', $oid)) {
+            continue;
+        }
+        $r = shoplineRequest('orders/v2/' . rawurlencode($oid) . '/risks.json');
+        if ($r['ok'] && is_array($r['data'])) {
+            $risks = $r['data']['risks'] ?? [];
+            $order['risks'] = is_array($risks) ? $risks : [];
+        }
+    }
+    unset($order);
+    return $data;
+}
+
+/** include_risks 是否启用（默认 true；显式 false / 'false' / 0 关闭） */
+function wantsRisks(array $args): bool
+{
+    if (!array_key_exists('include_risks', $args)) {
+        return true;
+    }
+    $v = $args['include_risks'];
+    if (is_string($v)) {
+        return !in_array(strtolower(trim($v)), ['false', '0', 'no', 'off', ''], true);
+    }
+    return (bool) $v;
+}
+
 function toolGetOrder(array $args): array
 {
     $id    = trim((string) ($args['order_id'] ?? ''));
     $email = trim((string) ($args['email'] ?? ''));
+    $withRisks = wantsRisks($args);
 
     if ($id === '' && $email === '') {
         return toolError('错误：请至少提供 order_id（订单号 / 订单 ID）或 email 之一');
@@ -1504,7 +1561,8 @@ function toolGetOrder(array $args): array
             return failText($r);
         }
         if (countList($r['data'], ['orders', 'items', 'data']) > 0) {
-            return formatResult("{$label} 详情：", $r['data']);
+            $data = $withRisks && is_array($r['data']) ? attachOrderRisks($r['data']) : $r['data'];
+            return formatResult("{$label} 详情：", $data);
         }
 
         if ($email === '') {
@@ -1535,14 +1593,87 @@ function toolGetOrder(array $args): array
     }
 
     if ($n === 1) {
-        return formatResult($prefix . "按邮箱 {$email} 找到 1 笔订单：", $r2['data']);
+        $data = $withRisks && is_array($r2['data']) ? attachOrderRisks($r2['data']) : $r2['data'];
+        return formatResult($prefix . "按邮箱 {$email} 找到 1 笔订单：", $data);
     }
 
     // 多笔：每笔都输出完整详情（注意：文本会较长，超出上限会截断）
+    $data = $withRisks && is_array($r2['data']) ? attachOrderRisks($r2['data']) : $r2['data'];
     return formatResult(
         $prefix . "邮箱 {$email} 下共 {$n} 笔订单（完整详情）：",
-        $r2['data']
+        $data
     );
+}
+
+/**
+ * 查询订单欺诈风险。
+ *
+ * 注意：SHOPLINE 的 GET orders/v2/{order_id}/risks.json 只接受【内部数字订单 ID】，
+ * 传订单号（如 MG3812）会返回 HTTP 500 T-ORD-A-INVALID_ARGUMENT。
+ * 因此这里先把订单号/邮箱解析为数字 ID（复用订单双查逻辑，兼容隐藏订单），再请求风控接口。
+ */
+function toolGetOrderRisks(array $args): array
+{
+    $id    = trim((string) ($args['order_id'] ?? ''));
+    $email = trim((string) ($args['email'] ?? ''));
+
+    if ($id === '' && $email === '') {
+        return toolError('错误：请至少提供 order_id（订单号 / 订单 ID）或 email 之一');
+    }
+    if ($id !== '' && strpos($id, '@') !== false) {
+        return toolError("错误：order_id 不接受邮箱，请改用 email 参数（收到：{$id}）");
+    }
+
+    $numericId = '';
+    $label     = '';
+
+    // ① 纯数字 ID 直接用（无需解析）
+    if ($id !== '' && preg_match('/^\d+$/', $id)) {
+        $numericId = $id;
+        $label     = "订单 ID {$id}";
+    } else {
+        // ② 订单号 / 邮箱 → 先解析出内部数字 ID（覆盖隐藏单）
+        if ($id !== '') {
+            $r = ordersRequestSingle(['name' => $id]);
+            $label = "订单号 {$id}";
+        } else {
+            $r = ordersRequestBoth(['email' => $email, 'limit' => 20]);
+            $label = "邮箱 {$email}";
+        }
+        if (!$r['ok']) {
+            return failText($r);
+        }
+        $orders = $r['data']['orders'] ?? [];
+        if (count($orders) === 0) {
+            return [
+                'text'    => "未找到{$label} 对应的订单，无法查询欺诈风险",
+                'data'    => ['risks' => []],
+                'isError' => false,
+            ];
+        }
+        $numericId = (string) ($orders[0]['id'] ?? '');
+        if ($numericId === '') {
+            return toolError("{$label} 解析出的订单缺少内部 ID，无法查询欺诈风险");
+        }
+    }
+
+    // ③ 请求风控接口（只认数字 ID，路径需 urlencode）
+    $r = shoplineRequest('orders/v2/' . rawurlencode($numericId) . '/risks.json');
+    if (!$r['ok']) {
+        return failText($r);
+    }
+    $risks = $r['data']['risks'] ?? [];
+    $n     = is_array($risks) ? count($risks) : 0;
+
+    if ($n === 0) {
+        return [
+            'text'    => "{$label}（ID {$numericId}）无欺诈风险记录",
+            'data'    => is_array($r['data']) ? $r['data'] : ['risks' => []],
+            'isError' => false,
+        ];
+    }
+
+    return formatResult("{$label}（ID {$numericId}）欺诈风险（共 {$n} 条）：", $r['data']);
 }
 
 function toolListProducts(array $args): array
@@ -1674,11 +1805,12 @@ function toolApiRequest(array $args): array
     ];
     $isWhitelisted = in_array($path, $whitelist, true)
         || preg_match('#^products/[A-Za-z0-9_\-]+\.json$#', $path)
-        || preg_match('#^customers/v2/[A-Za-z0-9_\-]+\.json$#', $path);
+        || preg_match('#^customers/v2/[A-Za-z0-9_\-]+\.json$#', $path)
+        || preg_match('#^orders/v2/\d+/risks\.json$#', $path);
 
     if (!$isWhitelisted) {
         return toolError("错误：路径 {$path} 不在只读白名单内。\n允许的路径：" . implode('、', $whitelist)
-            . '，以及 products/{id}.json、customers/v2/{id}.json。');
+            . '，以及 products/{id}.json、customers/v2/{id}.json、orders/v2/{数字ID}/risks.json。');
     }
 
     $query = is_array($args['query'] ?? null) ? $args['query'] : [];
